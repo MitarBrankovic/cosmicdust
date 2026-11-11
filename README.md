@@ -31,28 +31,20 @@ It is built for nodes with little CPU and memory to spare, on links that are slo
 ```
 
 **On the node.** Lifecycle events come from both runtimes and are merged into one state per container; after every
-reconnect the state is reconciled with a listing, and an out-of-memory kill is confirmed from the kernel's counters
-([0004](docs/design/0004-container-state.md)). Logs are read from the files the runtime writes (json-file and CRI),
-by one scheduler for all files, which follows rotations and backs off on quiet files
-([0005](docs/design/0005-tailer.md)). Lines and events go to a write-ahead log together with the position reading
-resumes from ([0006](docs/design/0006-wal.md)), and from there into Parquet files by hour, sorted and compressed with
-zstd, each line with its container, its application and the container's state at that moment
-([0007](docs/design/0007-parquet-store.md), [0009](docs/design/0009-streaming-conversion.md)).
+reconnect the state is reconciled with a listing, and an out-of-memory kill is confirmed from the kernel's counters.
+Logs are read from the files the runtime writes (json-file and CRI), by one scheduler for all files, which follows
+rotations and backs off on quiet files. Lines and events go to a write-ahead log together with the position reading
+resumes from, and from there into Parquet files by hour, sorted and compressed with zstd, each line with its
+container, its application and the container's state at that moment.
 
 **Between them.** At intervals (10 s by default) the finished files are sent whole, in chunks, after a probe that
-tells whether the receiver already has the file or a part of it, so a broken upload is continued and not started over. A container
-that died with an error or was killed for memory is also reported at once, on a connection of its own
-([0010](docs/design/0010-sync.md)). The protocol is in [`pkg/api`](pkg/api/proto/sync.proto); it travels over gRPC
-or, as an option, over NATS.
+tells whether the receiver already has the file or a part of it, so a broken upload is continued and not started over.
+A container that died with an error or was killed for memory is also reported at once, on a connection of its own. The
+protocol is in [`pkg/api`](pkg/api/proto/sync.proto); it travels over gRPC or, as an option, over NATS.
 
 **On the control plane.** The server acknowledges a file once it is complete, checked and durable, and only then
-archives and indexes it, so a slow Elasticsearch never holds files on the nodes
-([0011](docs/design/0011-control-plane-acknowledge-then-archive-then-index.md)). The archive is plain Parquet split
-by application ([0012](docs/design/0012-control-plane-archive-split-by-application.md)); each application has its
-own retention for the index and for the archive
-([0013](docs/design/0013-control-plane-retention-per-application.md)).
-
-The decisions and the measurements behind them are in [`docs/design`](docs/design/README.md).
+archives and indexes it, so a slow Elasticsearch never holds files on the nodes. The archive is plain Parquet split by
+application; each application has its own retention for the index and for the archive.
 
 ## Guarantees and limits
 
@@ -118,8 +110,7 @@ agent `-sync-url nats://<server>:4222`.
 ### Agent
 
 Every flag can also be set through the environment, as `COSMICDUST_` and the flag's name in upper case with
-underscores: `-data-dir` is `COSMICDUST_DATA_DIR`. A flag on the command line wins over the environment
-([0002](docs/design/0002-configuration.md)).
+underscores: `-data-dir` is `COSMICDUST_DATA_DIR`. A flag on the command line wins over the environment.
 
 | Flag | Default | |
 |---|---|---|
@@ -197,7 +188,7 @@ instead of holding up the files behind it.
 ## Embedding the agent
 
 A program that already runs on every node can run the node side itself, with package `node`; `cosmicdust-agent` is
-that package plus flags ([0008](docs/design/0008-public-node-package.md)).
+that package plus flags.
 
 ```go
 n, err := node.New(node.Options{
@@ -240,7 +231,6 @@ internal/server/              the server's parts: configs, ledger, receiver, urg
 internal/servertest/          a minimal receiving side of the protocol, for tests
 internal/{metrics,nodeid,fsutil,retry}/   self-metrics endpoint, node identity, atomic writes, reconnect backoff
 deploy/agent/, deploy/server/ Dockerfiles and compose files
-docs/design/                  design records
 ```
 
 ## Development

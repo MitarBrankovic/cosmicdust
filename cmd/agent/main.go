@@ -142,8 +142,7 @@ func off[T int64 | time.Duration](v T) T {
 // applyMemoryLimit sets the Go runtime's soft memory limit. Without one the
 // garbage collector lets the heap double before it runs and resident memory
 // follows. 64 MiB costs no CPU at 1,000 or 5,000 lines/s; 48 MiB saves ~11 MB
-// and costs 12 % more CPU at 1,000 lines/s, 80 % more at 5,000; see
-// docs/design/0009-streaming-conversion.md.
+// and costs 12 % more CPU at 1,000 lines/s, 80 % more at 5,000.
 // GOMEMLIMIT, if set, has already been applied by the runtime and wins.
 func applyMemoryLimit(log *slog.Logger, limit size) {
 	if v, ok := os.LookupEnv("GOMEMLIMIT"); ok {
