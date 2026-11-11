@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	reflectpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/c12s/cosmicdust/internal/server/configs"
@@ -65,6 +67,9 @@ func (f *fakeES) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, `{"items":[%s]}`, strings.Join(items, ","))
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/_data_stream/"):
 		_, _ = io.WriteString(w, `{"data_streams":[]}`)
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/_search"):
+		_, _ = io.WriteString(w, `{"hits":{"hits":[{"_source":{"@timestamp":"2026-10-29T08:00:00Z","node":"n1",`+
+			`"container_id":"c1","message":"line-0"},"sort":[1,"c1",5,6,0]}]}}`)
 	default: // templates, streams, lifecycles
 		_, _ = io.WriteString(w, `{"acknowledged":true}`)
 	}
@@ -185,6 +190,29 @@ func uploadNATS(t *testing.T, nc *nats.Conn, ref *api.FileRef, data []byte) *api
 	return ack
 }
 
+// services are the gRPC services the server names over reflection.
+func services(t *testing.T, conn *grpc.ClientConn) []string {
+	t.Helper()
+	stream, err := reflectpb.NewServerReflectionClient(conn).ServerReflectionInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.CloseSend() }()
+	if err := stream.Send(&reflectpb.ServerReflectionRequest{
+		MessageRequest: &reflectpb.ServerReflectionRequest_ListServices{}}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, s := range resp.GetListServicesResponse().GetService() {
+		names = append(names, s.GetName())
+	}
+	return names
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(20 * time.Millisecond) {
@@ -243,6 +271,15 @@ func TestService(t *testing.T) {
 	}
 	waitFor(t, "the index", func() bool { return es.count("cosmicdust-logs-") == want && es.count("cosmicdust-urgent") == 1 })
 
+	// The query API is on the same server, and reflection names both services.
+	logs, err := api.NewQueryClient(conn).GetLogs(context.Background(), &api.GetLogsRequest{Node: "n1"})
+	if err != nil || len(logs.GetLines()) != 1 || logs.Lines[0].Line != "line-0" {
+		t.Fatalf("query: %v %v", logs, err)
+	}
+	if got := services(t, conn); !slices.Contains(got, "cosmicdust.v1.Query") || !slices.Contains(got, "cosmicdust.v1.Sync") {
+		t.Errorf("reflection names %v", got)
+	}
+
 	resp, err := http.Get("http://" + app.HTTPAddr().String() + "/metrics")
 	if err != nil {
 		t.Fatal(err)
@@ -250,6 +287,7 @@ func TestService(t *testing.T) {
 	metrics, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if !strings.Contains(string(metrics), "cosmicdust_server_files_received_total") ||
+		!strings.Contains(string(metrics), "cosmicdust_server_queries_total 1") ||
 		!strings.Contains(string(metrics), "cosmicdust_server_elasticsearch_up 1") {
 		t.Errorf("metrics:\n%s", metrics)
 	}

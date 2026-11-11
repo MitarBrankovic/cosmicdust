@@ -1,0 +1,135 @@
+// The query API of the server: what the nodes sent, read back by node. It
+// answers from the search index, so it covers what the index still keeps
+// (each application's search retention) and needs Elasticsearch.
+syntax = "proto3";
+
+package cosmicdust.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/c12s/cosmicdust/pkg/api;api";
+
+service Query {
+  // ListNodes lists the nodes that sent logs or events in a period.
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  // ListContainers lists the containers seen on a node in a period, the most
+  // recently active first.
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+
+  // GetLogs returns log lines of a node, oldest first, a page at a time.
+  rpc GetLogs(GetLogsRequest) returns (GetLogsResponse);
+
+  // GetEvents returns lifecycle events of a node, oldest first, a page at a
+  // time.
+  rpc GetEvents(GetEventsRequest) returns (GetEventsResponse);
+}
+
+// TimeRange is a period: from is included, to is not. An unset end is open.
+message TimeRange {
+  google.protobuf.Timestamp from = 1;
+  google.protobuf.Timestamp to = 2;
+}
+
+message ListNodesRequest {
+  TimeRange period = 1;
+}
+
+message NodeSummary {
+  string node = 1;
+  int64 log_lines = 2;
+  int64 events = 3;
+  google.protobuf.Timestamp first = 4; // the oldest line or event in the period
+  google.protobuf.Timestamp last = 5;  // the newest
+}
+
+message ListNodesResponse {
+  repeated NodeSummary nodes = 1; // by node, at most 10,000
+}
+
+message ListContainersRequest {
+  string node = 1; // required
+  TimeRange period = 2;
+}
+
+message ContainerSummary {
+  string container_id = 1;
+  string name = 2;
+  string image = 3;
+  string app = 4;
+  int64 log_lines = 5;
+  int64 events = 6;
+  google.protobuf.Timestamp first = 7;
+  google.protobuf.Timestamp last = 8;
+}
+
+message ListContainersResponse {
+  repeated ContainerSummary containers = 1; // at most 10,000
+}
+
+message GetLogsRequest {
+  string node = 1; // required
+  TimeRange period = 2;
+
+  // Filters; an empty one does not filter.
+  string app = 3;
+  string container = 4; // a container's ID or its name
+  string stream = 5;    // "stdout" or "stderr"
+  string contains = 6;  // words the line must contain, all of them
+
+  int32 page_size = 7;   // lines in an answer: 100 by default, at most 1,000
+  string page_token = 8; // next_page_token of the answer before, to continue after it
+}
+
+message LogLine {
+  google.protobuf.Timestamp time = 1; // the runtime's time of the line
+  string node = 2;
+  string app = 3;
+  string container_id = 4;
+  string name = 5;
+  string image = 6;
+  string stream = 7;
+  string line = 8;
+  string state = 9;    // the container's state when the line was written
+  int32 epoch = 10;    // the container's incarnation
+  bool truncated = 11; // the line was longer than the agent keeps
+}
+
+message GetLogsResponse {
+  repeated LogLine lines = 1;
+  string next_page_token = 2; // empty: there is no more
+}
+
+message GetEventsRequest {
+  string node = 1; // required
+  TimeRange period = 2;
+
+  // Filters; an empty one does not filter.
+  string container = 3; // a container's ID or its name
+  string kind = 4;      // "create", "start", "exit", "oom", "restart", "remove", "resync" or "other"
+
+  int32 page_size = 5;   // events in an answer: 100 by default, at most 1,000
+  string page_token = 6; // next_page_token of the answer before
+}
+
+message LifecycleEvent {
+  google.protobuf.Timestamp time = 1; // the runtime's time of the event
+  string node = 2;
+  string app = 3;
+  string container_id = 4;
+  string name = 5;
+  string image = 6;
+  string runtime = 7; // "docker", "containerd", or "cosmicdust" for the agent's own events
+  string action = 8;  // the runtime's own name: "die", "/tasks/exit", "oom", ...
+  string kind = 9;
+  string state = 10;  // the container's state after the event
+  int32 epoch = 11;
+  optional int32 exit_code = 12; // unset when the event carries none
+  bool oom_killed = 13;
+  bool inferred = 14; // not reported by the runtime: concluded from a listing
+}
+
+message GetEventsResponse {
+  repeated LifecycleEvent events = 1;
+  string next_page_token = 2; // empty: there is no more
+}

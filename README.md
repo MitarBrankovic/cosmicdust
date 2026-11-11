@@ -105,6 +105,34 @@ out-of-memory counters of the other containers are.
 To send over NATS instead, start the compose file with `NATS_ADDRESS=nats:4222` and `--profile nats`, and give the
 agent `-sync-url nats://<server>:4222`.
 
+## Reading the logs
+
+Other services read what the nodes sent through the server's query API, the gRPC service `cosmicdust.v1.Query`
+([`pkg/api/proto/query.proto`](pkg/api/proto/query.proto)), on the address the nodes send to:
+
+| Call | Returns |
+|---|---|
+| `ListNodes` | the nodes that sent logs or events in a period, with their counts and the first and the last time |
+| `ListContainers` | the containers seen on a node in a period, the most recently active first |
+| `GetLogs` | log lines of a node, oldest first; filters: application, container (ID or name), stream, words of the line |
+| `GetEvents` | lifecycle events of a node, oldest first; filters: container, kind (`start`, `exit`, `oom`, ...) |
+
+`GetLogs` and `GetEvents` answer a page at a time (100 rows by default, at most 1,000). A full page comes with a
+`next_page_token`; sent back as `page_token`, it continues after the last row, without skipping or repeating one.
+
+The server answers gRPC reflection, so `grpcurl` needs no proto files:
+
+```sh
+grpcurl -plaintext localhost:50051 cosmicdust.v1.Query/ListNodes
+grpcurl -plaintext -d '{"node": "<node>"}' localhost:50051 cosmicdust.v1.Query/ListContainers
+grpcurl -plaintext -d '{"node": "<node>", "container": "web", "contains": "error", "page_size": 50}' \
+    localhost:50051 cosmicdust.v1.Query/GetLogs
+grpcurl -plaintext -d '{"node": "<node>", "kind": "exit"}' localhost:50051 cosmicdust.v1.Query/GetEvents
+```
+
+The API answers from the search index: it needs Elasticsearch, and it reaches as far back as each application's search
+retention. What is older is in the archive, as Parquet.
+
 ## Configuration
 
 ### Agent
@@ -217,7 +245,7 @@ cmd/server/                   the server: receives the nodes' files, archives, i
 cmd/walcat/                   prints what a WAL directory holds, as JSON Lines
 pkg/cosmicdust/               public API: data model, interfaces, the component runner
 pkg/node/                     public API: the node side assembled from options, for the agent and for embedding
-pkg/api/                      the protocol between node and server: proto/sync.proto and generated code
+pkg/api/                      the protocols, proto/ and generated code: sync (node to server) and query (reading)
 internal/runtime/docker/      event source for dockerd: events, list and inspect
 internal/runtime/containerd/  event source for containerd: events, list, describe
 internal/lifecycle/           container state: views per runtime, merge, reconciliation, history, snapshot, OOM
@@ -227,7 +255,7 @@ internal/store/               Parquet by hour, manifests, one commit point, comp
 internal/syncer/              the sync engine (rounds, claims, backoff) and the urgent channel
 internal/transport/           gRPC and NATS transports: probe, chunks, continuing a broken upload, rate limit
 internal/server/              the server's parts: configs, ledger, receiver, urgent spool, archive, Elasticsearch
-                              client, indexer, retention, servers, metrics, startup
+                              client, indexer, retention, query API, servers, metrics, startup
 internal/servertest/          a minimal receiving side of the protocol, for tests
 internal/{metrics,nodeid,fsutil,retry}/   self-metrics endpoint, node identity, atomic writes, reconnect backoff
 deploy/agent/, deploy/server/ Dockerfiles and compose files
@@ -239,7 +267,7 @@ deploy/agent/, deploy/server/ Dockerfiles and compose files
 make test             # go vet and the unit tests under the race detector
 make lint             # gofmt, staticcheck, golangci-lint
 make integration      # lifecycle and tailer scenarios against the node's dockerd and containerd (sudo)
-ES_ADDRESS=http://localhost:9200 make integration-es   # the indexer against a real Elasticsearch
+ES_ADDRESS=http://localhost:9200 make integration-es   # the indexer and the query API against Elasticsearch
 make build            # bin/cosmicdust-{agent,server}-{amd64,arm64}
 make proto            # regenerate pkg/api from pkg/api/proto
 ```

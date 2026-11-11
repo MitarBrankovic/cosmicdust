@@ -11,6 +11,7 @@ import (
 	"github.com/c12s/cosmicdust/internal/server/archive"
 	"github.com/c12s/cosmicdust/internal/server/indexer"
 	"github.com/c12s/cosmicdust/internal/server/ledger"
+	"github.com/c12s/cosmicdust/internal/server/query"
 	"github.com/c12s/cosmicdust/internal/server/receiver"
 	"github.com/c12s/cosmicdust/internal/server/retention"
 	"github.com/c12s/cosmicdust/internal/server/urgent"
@@ -25,6 +26,7 @@ type Parts struct {
 	Indexer  *indexer.Indexer
 	Cleaner  *retention.Cleaner
 	Ledger   *ledger.Ledger
+	Query    *query.Service
 }
 
 const namespace = "cosmicdust_server"
@@ -89,6 +91,11 @@ func Register(reg prometheus.Registerer, p Parts) error {
 	c := &p.Cleaner.Stats
 	counter("retention_hours_removed_total", "Hours of an application's archive removed past its retention.", &c.Partitions, nil)
 	counter("retention_sweeps_total", "Sweeps of the archive.", &c.Sweeps, nil)
+
+	if q := p.Query; q != nil {
+		counter("queries_total", "Calls of the query API.", &q.Stats.Requests, nil)
+		counter("query_failures_total", "Calls of the query API answered with an error, a bad request included.", &q.Stats.Failures, nil)
+	}
 
 	for _, col := range cs {
 		if err := reg.Register(col); err != nil {

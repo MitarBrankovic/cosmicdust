@@ -151,8 +151,8 @@ func (x *Indexer) round(ctx context.Context) error {
 func (x *Indexer) setup(ctx context.Context) error {
 	def := x.retention.Default
 	for name, t := range map[string]map[string]any{
-		x.prefix + "-logs":   template(x.prefix+"-logs-*", def.Logs.Search.D(), x.replicas, logMappings()),
-		x.prefix + "-events": template(x.prefix+"-events-*", def.Events.Search.D(), x.replicas, eventMappings(false)),
+		x.prefix + "-logs":   template(StreamPattern(x.prefix, api.TableLogs), def.Logs.Search.D(), x.replicas, logMappings()),
+		x.prefix + "-events": template(StreamPattern(x.prefix, api.TableEvents), def.Events.Search.D(), x.replicas, eventMappings(false)),
 		x.prefix + "-urgent": template(UrgentStream(x.prefix), x.retention.Urgent.D(), x.replicas, eventMappings(true)),
 	} {
 		if err := x.es.PutIndexTemplate(ctx, name, t); err != nil {

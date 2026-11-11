@@ -21,12 +21,12 @@ integration:
 		sudo /tmp/cosmicdust-$$p.test -test.run Integration -test.v || exit 1; \
 	done
 
-# The server's indexer against a real Elasticsearch. ES_ADDRESS has no default
-# on purpose: the test puts templates and data streams, so it must never meet
-# a cluster by accident.
+# The server against a real Elasticsearch: the indexer, and the query API over
+# what it indexed. ES_ADDRESS has no default on purpose: the tests put templates
+# and data streams, so they must never meet a cluster by accident.
 integration-es:
 	@test -n "$$ES_ADDRESS" || { echo "set ES_ADDRESS to an Elasticsearch for tests"; exit 2; }
-	ES_REQUIRED=1 go test -tags integration -count=1 -run Integration ./internal/server/indexer/
+	ES_REQUIRED=1 go test -tags integration -count=1 -run Integration ./internal/server/...
 
 # bin/cosmicdust-{agent,server}-{amd64,arm64}
 build:
