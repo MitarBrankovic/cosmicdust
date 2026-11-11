@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"log\":\"\x00\",\"stream\":\"stderr\",\"time\":\"0000-10-01T0:00:00Z\"}")
