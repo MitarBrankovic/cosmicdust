@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: vet
+        run: go vet ./...
+      - name: nats-server, for the NATS transport tests
+        run: go install github.com/nats-io/nats-server/v2@v2.15.0
+      - name: test
+        run: go test -race -count=1 ./...
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: lifecycle and tailer scenarios against the runner's dockerd and containerd
+        run: |
+          for p in lifecycle tail; do
+            go test -tags integration -c -o $p.test ./internal/$p
+            sudo ./$p.test -test.run Integration -test.v
+          done
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: build the agent (linux/${{ matrix.arch }})
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::12}" -o cosmicdust-agent-${{ matrix.arch }} ./cmd/agent
