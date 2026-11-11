@@ -21,3 +21,12 @@ Between the node and the control plane:
 | | |
 |---|---|
 | [0010](0010-sync.md) | Sync: whole files, probed and continued, at least once into an idempotent receiver |
+
+The control plane:
+
+| | |
+|---|---|
+| [0011](0011-control-plane-acknowledge-then-archive-then-index.md) | Acknowledge once received, then archive, then index |
+| [0012](0012-control-plane-archive-split-by-application.md) | The archive is split by application |
+| [0013](0013-control-plane-retention-per-application.md) | Retention per application, archive hours and data stream lifecycles |
+| [0014](0014-control-plane-shares-the-protocol-and-has-its-own-es-client.md) | The node's protocol and schema, and an Elasticsearch client of its own |

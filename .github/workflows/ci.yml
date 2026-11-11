@@ -43,6 +43,32 @@ jobs:
             sudo ./$p.test -test.run Integration -test.v
           done
 
+  elasticsearch:
+    runs-on: ubuntu-latest
+    services:
+      elasticsearch:
+        image: elasticsearch:9.5.5
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -fs localhost:9200/_cluster/health"
+          --health-interval 5s
+          --health-retries 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: the server's indexer against Elasticsearch
+        env:
+          ES_ADDRESS: http://localhost:9200
+          ES_REQUIRED: "1"
+        run: go test -tags integration -count=1 -v -run Integration ./internal/server/indexer/
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -53,9 +79,11 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: build the agent (linux/${{ matrix.arch }})
+      - name: build the agent and the server (linux/${{ matrix.arch }})
         env:
           CGO_ENABLED: "0"
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
-        run: go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::12}" -o cosmicdust-agent-${{ matrix.arch }} ./cmd/agent
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::12}" -o cosmicdust-agent-${{ matrix.arch }} ./cmd/agent
+          go build -trimpath -ldflags "-s -w" -o cosmicdust-server-${{ matrix.arch }} ./cmd/server
