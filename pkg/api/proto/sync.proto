@@ -1,0 +1,83 @@
+// The sync protocol between a node and the control plane. The same messages
+// travel over NATS (one message per chunk, acks on a reply inbox) and over
+// gRPC (a probe, then one client stream per file), so the two transports
+// differ only in how they carry them.
+syntax = "proto3";
+
+package cosmicdust.v1;
+
+option go_package = "github.com/c12s/cosmicdust/pkg/api;api";
+
+// FileRef names one finished Parquet file of a node's store. node, table,
+// partition and name are the file's identity; crc32c and size say which
+// content is meant, so a second upload of the same file is recognised and
+// acknowledged at once.
+message FileRef {
+  string node = 1;
+  string table = 2;     // "logs" or "events"
+  string partition = 3; // "dt=2026-10-22/hour=09"
+  string name = 4;      // "part-00000000000000000412-001.parquet"
+  uint32 crc32c = 5;
+  int64 size = 6;
+  int64 rows = 7;
+  int64 min_ts = 8; // unix nanoseconds, the oldest row
+  int64 max_ts = 9; // the newest
+}
+
+// Chunk is a piece of a file. Chunks go in order; every one carries the file
+// reference, so the receiver keeps no session beyond the partial file.
+message Chunk {
+  FileRef file = 1;
+  int64 offset = 2;
+  bytes data = 3;
+  bool last = 4;
+
+  // probe asks, without data, whether the receiver is there and what it
+  // holds of the file: all of it (duplicate), or the first Ack.have bytes
+  // of an upload that broke off, which the sender continues after. A
+  // sender probes before every file, so a dead receiver behind a broker
+  // costs one small message, not the file.
+  bool probe = 5;
+
+  // upload names one attempt of the sender to send the file. A probe hands
+  // the partial file to its attempt: chunks of an attempt that broke off,
+  // still on their way, then cannot move the copy from under the attempt
+  // that continues it. 0: no attempt named.
+  uint64 upload = 6;
+}
+
+// Ack answers a probe and every chunk (NATS) or a whole upload (gRPC).
+message Ack {
+  bool ok = 1;
+  string error = 2;   // when not ok: why
+  bool duplicate = 3; // the receiver already has this file with this content
+  bool stored = 4;    // the file is complete and durable on the receiver
+  int64 have = 5;     // for a probe: bytes of the file the receiver holds
+}
+
+// Event is a lifecycle event sent at once, on its own connection: a container
+// that died with a non-zero exit code or was killed for memory. The same event
+// also reaches the control plane with the events table; this copy only makes
+// it arrive without waiting for the next file.
+message Event {
+  string node = 1;
+  int64 ts = 2; // unix nanoseconds, the runtime's time of the event
+  string runtime = 3;
+  string namespace = 4;
+  string container_id = 5;
+  string name = 6;
+  string image = 7;
+  string app = 8;
+  string action = 9; // the runtime's own name: "die", "/tasks/exit", "oom", ...
+  string kind = 10;  // "exit" or "oom"
+  int32 exit_code = 11; // -1 when the event carries none
+  bool oom_killed = 12;
+  int32 epoch = 13;  // the container's incarnation
+  int64 sent_at = 14; // unix nanoseconds, when the node sent it
+}
+
+service Sync {
+  rpc Probe(Chunk) returns (Ack);
+  rpc Upload(stream Chunk) returns (Ack);
+  rpc Urgent(Event) returns (Ack);
+}
