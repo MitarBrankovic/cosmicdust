@@ -63,11 +63,11 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: the server's indexer against Elasticsearch
+      - name: the server.s indexer and query API against Elasticsearch
         env:
           ES_ADDRESS: http://localhost:9200
           ES_REQUIRED: "1"
-        run: go test -tags integration -count=1 -v -run Integration ./internal/server/indexer/
+        run: go test -tags integration -count=1 -v -run Integration ./internal/server/...
 
   build:
     runs-on: ubuntu-latest

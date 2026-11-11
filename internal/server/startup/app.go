@@ -32,6 +32,7 @@ import (
 	"github.com/c12s/cosmicdust/internal/server/indexer"
 	"github.com/c12s/cosmicdust/internal/server/ledger"
 	"github.com/c12s/cosmicdust/internal/server/metrics"
+	"github.com/c12s/cosmicdust/internal/server/query"
 	"github.com/c12s/cosmicdust/internal/server/receiver"
 	"github.com/c12s/cosmicdust/internal/server/retention"
 	"github.com/c12s/cosmicdust/internal/server/servers"
@@ -49,6 +50,7 @@ type App struct {
 	archiver *archive.Archiver
 	indexer  *indexer.Indexer
 	cleaner  *retention.Cleaner
+	query    *query.Service
 
 	ready  atomic.Bool
 	cancel context.CancelFunc
@@ -127,11 +129,17 @@ func (a *App) Start() (err error) {
 	}
 	a.onStop(func(context.Context) { _ = a.receiver.Close() })
 	a.cleaner = retention.New(dir("archive"), c.DedupWindow, c.Retention, a.ledger, a.log.With("part", "retention"))
+	// The query API reads the index; without Elasticsearch it refuses.
+	var searcher query.Searcher
+	if client != nil {
+		searcher = client
+	}
+	a.query = query.New(searcher, c.EsIndexPrefix)
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	if err := metrics.Register(reg, metrics.Parts{Receiver: a.receiver, Spool: a.spool, Archiver: a.archiver,
-		Indexer: a.indexer, Cleaner: a.cleaner, Ledger: a.ledger}); err != nil {
+		Indexer: a.indexer, Cleaner: a.cleaner, Ledger: a.ledger, Query: a.query}); err != nil {
 		return err
 	}
 
@@ -194,7 +202,7 @@ func (a *App) startServers(reg *prometheus.Registry) error {
 			return err
 		}
 		a.grpcAddr = lis.Addr()
-		srv := servers.NewGRPCServer(a.receiver, a.spool)
+		srv := servers.NewGRPCServer(a.receiver, a.spool, a.query)
 		go func() {
 			if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 				a.log.Error("gRPC server stopped", "err", err)

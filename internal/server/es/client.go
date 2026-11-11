@@ -1,5 +1,5 @@
 // Package es is the little of the Elasticsearch REST API the service uses:
-// bulk indexing, index templates, data streams and their lifecycle. A client
+// bulk indexing, index templates, data streams and their lifecycle, search. A client
 // of its own keeps the dependency small, and every request is one the
 // service's tests can answer with a fake server.
 package es
@@ -229,6 +229,18 @@ func (c *Client) Bulk(ctx context.Context, body []byte) ([]BulkItem, error) {
 		}
 	}
 	return items, nil
+}
+
+// Search runs a search, body, over the indices matching pattern and decodes
+// the answer into out. A pattern that matches nothing yet is no error: the
+// answer is then empty.
+func (c *Client) Search(ctx context.Context, pattern string, body, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, "/"+url.PathEscape(pattern)+"/_search?ignore_unavailable=true&allow_no_indices=true",
+		data, "application/json", out)
 }
 
 // Refresh makes what was indexed into the matching indices searchable now.

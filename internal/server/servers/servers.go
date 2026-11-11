@@ -1,5 +1,6 @@
 // Package servers puts the receiver on NATS and gRPC, the two transports the
-// nodes use, and serves the metrics over HTTP.
+// nodes use, the query API on the same gRPC server, and serves the metrics
+// over HTTP.
 package servers
 
 import (
@@ -13,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/c12s/cosmicdust/internal/server/receiver"
@@ -62,11 +64,15 @@ func respond(m *nats.Msg, ack *api.Ack) {
 	}
 }
 
-// NewGRPCServer is the receiver as a gRPC server: a probe, then one client
-// stream per file, answered once - early for a duplicate or a refused chunk.
-func NewGRPCServer(r *receiver.Receiver, s *urgent.Spool) *grpc.Server {
+// NewGRPCServer is the gRPC server: the receiver for the nodes - a probe, then
+// one client stream per file, answered once, early for a duplicate or a
+// refused chunk - and the query API for whoever reads what they sent. It
+// answers reflection, so that a client needs no proto files to call it.
+func NewGRPCServer(r *receiver.Receiver, s *urgent.Spool, q api.QueryServer) *grpc.Server {
 	srv := grpc.NewServer()
 	api.RegisterSyncServer(srv, &grpcServer{r: r, s: s})
+	api.RegisterQueryServer(srv, q)
+	reflection.Register(srv)
 	return srv
 }
 

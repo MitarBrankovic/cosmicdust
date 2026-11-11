@@ -21,6 +21,9 @@ func StreamName(prefix, table, app string) string {
 	return prefix + "-" + table + "-" + streamApp(app)
 }
 
+// StreamPattern matches the data streams of a table, of every application.
+func StreamPattern(prefix, table string) string { return prefix + "-" + table + "-*" }
+
 // UrgentStream is the data stream of urgent events.
 func UrgentStream(prefix string) string { return prefix + "-urgent" }
 
