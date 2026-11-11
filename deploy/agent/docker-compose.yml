@@ -1,0 +1,35 @@
+# The node daemon in a container, on a node with Docker and the containerd it
+# runs on. It reads what the runtimes write - log files, sockets, the kernel's
+# cgroup counters - read-only, and keeps its own state in a volume. The cgroup
+# namespace is the host's, so that the OOM counters of the other containers
+# are visible.
+#
+#   COSMICDUST_SYNC_URL=grpc://control-plane:50051 docker compose -f deploy/agent/docker-compose.yml up -d --build
+#
+# Every cosmicdust-agent flag can be set as COSMICDUST_<FLAG> (README, Configuration).
+
+services:
+  cosmicdust-agent:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    restart: unless-stopped
+    cgroup: host
+    environment:
+      - COSMICDUST_SYNC_URL=${COSMICDUST_SYNC_URL:-}
+      - COSMICDUST_APP_LABELS=${COSMICDUST_APP_LABELS:-}
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+      - cosmicdust-data:/var/lib/cosmicdust
+      # With a kubelet, its CRI log files too:
+      # - /var/log/pods:/var/log/pods:ro
+    ports:
+      - "9101:9101"
+    # The budget the measurements kept to: a quarter of a core and 128 MB.
+    # cpus: 0.25
+    # mem_limit: 128m
+
+volumes:
+  cosmicdust-data:
