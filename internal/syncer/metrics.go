@@ -56,11 +56,11 @@ type urgentMetrics struct {
 func newUrgentMetrics(reg prometheus.Registerer) (*urgentMetrics, error) {
 	m := &urgentMetrics{
 		result: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "cosmicdust_agent", Subsystem: "sync", Name: "urgent_total",
-			Help: "Urgent events, by result: stored, duplicate, rejected, failed (given up), dropped (queue full), or stopped (an exit Docker was asked for, not sent)."},
+			Help: "Urgent events, by result: stored, duplicate, rejected, failed (given up after waiting too long), dropped (queue full), or stopped (an exit Docker was asked for, not sent)."},
 			[]string{"result"}),
 		latency: prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "cosmicdust_agent", Subsystem: "sync",
 			Name: "urgent_latency_seconds", Help: "From the runtime's time of an urgent event to its answer.",
-			Buckets: []float64{.05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60}}),
+			Buckets: []float64{.05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300, 600}}),
 	}
 	for _, r := range []string{"stored", "duplicate", "rejected", "failed", "dropped", "stopped"} {
 		m.result.WithLabelValues(r)
