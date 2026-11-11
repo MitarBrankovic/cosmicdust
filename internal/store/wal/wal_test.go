@@ -377,10 +377,13 @@ func TestKeepHoldsReleasedSegments(t *testing.T) {
 		t.Fatalf("still held after Keep passed it: %v", got)
 	}
 
-	// Never saved: held for KeepAtMost only.
+	// Never saved: held for KeepAtMost only. The hold counts from the
+	// segment's last block and from the start of the WAL, so the test moves
+	// both back instead of waiting: on a busy machine a short real hold can
+	// be over before the fsyncs between the block and the first check are.
 	w2 := open(t, t.TempDir(), func(o *Options) {
 		o.Keep = func() time.Time { return time.Time{} }
-		o.KeepAtMost = 20 * time.Millisecond
+		o.KeepAtMost = time.Minute
 	})
 	if err := w2.Add(recs("a", 1, 1)); err != nil {
 		t.Fatal(err)
@@ -395,7 +398,16 @@ func TestKeepHoldsReleasedSegments(t *testing.T) {
 	if len(w2.Sealed()) != 1 {
 		t.Fatal("not held")
 	}
-	time.Sleep(30 * time.Millisecond)
+	w2.tick()
+	if len(w2.Sealed()) != 1 {
+		t.Fatal("released before KeepAtMost passed")
+	}
+	w2.mu.Lock()
+	w2.start = w2.start.Add(-time.Hour)
+	for id, at := range w2.written {
+		w2.written[id] = at.Add(-time.Hour)
+	}
+	w2.mu.Unlock()
 	w2.tick()
 	if got := w2.Sealed(); len(got) != 0 {
 		t.Fatalf("held past KeepAtMost: %v", got)
