@@ -62,8 +62,8 @@ What it does not do:
 - Lines the runtime rotated away while the agent was stopped are gone. The agent counts them, and
   `cosmicdust_agent_tail_retention_seconds` says how long the shortest log on the node is kept.
 - Only json-file and CRI log files are read. Containers with another log driver are counted and left unread.
-- The immediate report of a failed container is a shortcut and is tried for a limited time; the event itself always
-  arrives with the events table.
+- The immediate report of a failed container is a shortcut. While the server is away the reports wait on the node, at
+  most 256 of them and each for at most ten minutes; the event itself always arrives with the events table.
 - There is no encryption or authentication on the nodes' connections yet.
 - Over NATS, one server instance per NATS server.
 - If a data stream rolls over between two attempts to index the same file, that file's documents are indexed twice.

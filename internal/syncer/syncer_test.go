@@ -465,17 +465,90 @@ func TestUrgentOncePerIncarnation(t *testing.T) {
 	<-done
 }
 
-func TestUrgentGivesUpAndDrops(t *testing.T) {
+// A control plane that is away does not cost the events their place: they
+// wait, however many attempts that takes, and go out in order when it is back.
+func TestUrgentWaitsOutAnOutage(t *testing.T) {
 	tr := newTransport()
-	tr.urgErr = func(int) error { return errors.New("down") }
-	u := urgent(t, tr, UrgentOptions{Queue: 1, Attempts: 3, Timeout: time.Second})
+	var down atomic.Bool
+	down.Store(true)
+	tr.urgErr = func(int) error {
+		if down.Load() {
+			return errors.New("down")
+		}
+		return nil
+	}
+	u := urgent(t, tr, UrgentOptions{backoff: retry.Backoff{Min: time.Millisecond, Max: 2 * time.Millisecond}})
+	const events = 10
+	for i := range events {
+		u.Push(exit(fmt.Sprintf("c%d", i), 1, 1))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- u.Run(ctx) }()
+	sent := func() (attempts int, delivered []string) {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		for _, e := range tr.urgent {
+			if e.ContainerID != "" {
+				delivered = append(delivered, e.ContainerID)
+			}
+		}
+		return len(tr.urgent), delivered
+	}
+	wait := func(what string, cond func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+		}
+	}
+	wait("attempts during the outage", func() bool { n, _ := sent(); return n >= 30 })
+	if _, delivered := sent(); len(delivered) != 0 {
+		t.Fatalf("delivered during the outage: %v", delivered)
+	}
+	down.Store(false)
+	wait("the events of the outage", func() bool { _, d := sent(); return len(d) == events })
+	cancel()
+	<-done
+	_, delivered := sent()
+	for i, id := range delivered {
+		if want := fmt.Sprintf("c%d", i); id != want {
+			t.Fatalf("delivered %v, want c0..c%d in order", delivered, events-1)
+		}
+	}
+	if stored, failed := testutil.ToFloat64(u.m.result.WithLabelValues("stored")), testutil.ToFloat64(u.m.result.WithLabelValues("failed")); stored != events || failed != 0 {
+		t.Fatalf("stored %v, failed %v", stored, failed)
+	}
+}
+
+// An event that has waited MaxAge is given up, and a full queue takes no more.
+func TestUrgentGivesUpAfterMaxAgeAndDrops(t *testing.T) {
+	tr := newTransport()
+	// A clock of the test's own: every attempt fails and takes a minute.
+	var mu sync.Mutex
+	now := time.Unix(1_000_000, 0)
+	clock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	tr.urgErr = func(int) error {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(time.Minute)
+		return errors.New("down")
+	}
+	u := urgent(t, tr, UrgentOptions{Queue: 1, MaxAge: 5 * time.Minute, Timeout: time.Second, now: clock,
+		backoff: retry.Backoff{Min: time.Microsecond, Max: time.Microsecond}})
 	u.Push(exit("a", 1, 1))
 	u.Push(exit("b", 1, 1)) // the queue holds one
 	if got := testutil.ToFloat64(u.m.result.WithLabelValues("dropped")); got != 1 {
 		t.Fatalf("dropped %v", got)
 	}
+	// After the fifth attempt the event is five minutes old.
 	u.send(context.Background(), <-u.ch)
-	if got := testutil.ToFloat64(u.m.result.WithLabelValues("failed")); got != 1 || len(tr.urgent) != 3 {
-		t.Fatalf("failed %v after %d attempts", got, len(tr.urgent))
+	if got := testutil.ToFloat64(u.m.result.WithLabelValues("failed")); got != 1 || len(tr.urgent) != 5 {
+		t.Fatalf("failed %v after %d attempts, want 1 after 5", got, len(tr.urgent))
 	}
 }

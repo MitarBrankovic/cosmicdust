@@ -38,10 +38,13 @@ type UrgentOptions struct {
 	// drops them (they still go with the events table). Default 256.
 	Queue int
 
-	// Attempts bounds the retries of one event, Timeout one attempt.
-	// Defaults 8 (about a minute with the backoff) and 10 s.
-	Attempts int
-	Timeout  time.Duration
+	// MaxAge is how long an event is worth sending at once. While the
+	// control plane cannot be reached, the events wait in the queue in
+	// order and go out when it is back; one that has waited longer than
+	// MaxAge is given up. Default 10 min. Timeout bounds one attempt,
+	// default 10 s.
+	MaxAge  time.Duration
+	Timeout time.Duration
 
 	// DockerNamespace is the containerd namespace of the containers Docker
 	// runs, when Docker is followed; empty when it is not. For those
@@ -53,18 +56,25 @@ type UrgentOptions struct {
 
 	Logger     *slog.Logger
 	Registerer prometheus.Registerer
+
+	// For tests: the clock the age of an event is read from, and the pauses
+	// between attempts (default 250 ms doubling to 5 s).
+	now     func() time.Time
+	backoff retry.Backoff
 }
 
-// Urgent sends urgent lifecycle events at once, one at a time, retrying with
-// backoff. It is a shortcut, not the record: every event is also in the WAL
-// and goes out with the events table, so a full queue or a control plane that
-// stays away drops the shortcut, never the event. Both runtimes report the
-// same exit, ~100-400 ms apart, so one event per container
-// incarnation is sent.
+// Urgent sends urgent lifecycle events at once, one at a time, in order. An
+// event the control plane cannot be reached for is tried again, with backoff,
+// until it is delivered or older than MaxAge, and the events behind it wait:
+// an outage delays them, it does not cost them their place. It is a shortcut,
+// not the record: every event is also in the WAL and goes out with the events
+// table, so a full queue or a control plane that stays away longer drops the
+// shortcut, never the event. Both runtimes report the same exit, ~100-400 ms
+// apart, so one event per container incarnation is sent.
 type Urgent struct {
 	opts UrgentOptions
 	log  *slog.Logger
-	ch   chan cosmicdust.Event
+	ch   chan queued
 	m    *urgentMetrics
 
 	mu    sync.Mutex
@@ -80,8 +90,8 @@ func NewUrgent(opts UrgentOptions) (*Urgent, error) {
 	if opts.Queue <= 0 {
 		opts.Queue = 256
 	}
-	if opts.Attempts <= 0 {
-		opts.Attempts = 8
+	if opts.MaxAge <= 0 {
+		opts.MaxAge = 10 * time.Minute
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = 10 * time.Second
@@ -89,12 +99,27 @@ func NewUrgent(opts UrgentOptions) (*Urgent, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.now == nil {
+		opts.now = time.Now
+	}
+	if opts.backoff.Min <= 0 {
+		// A short ceiling: an attempt at a control plane that is away costs
+		// nothing on the network, and the events of an outage should arrive
+		// within seconds of its end.
+		opts.backoff = retry.Backoff{Min: 250 * time.Millisecond, Max: 5 * time.Second}
+	}
 	m, err := newUrgentMetrics(opts.Registerer)
 	if err != nil {
 		return nil, err
 	}
-	return &Urgent{opts: opts, log: opts.Logger, ch: make(chan cosmicdust.Event, opts.Queue), m: m,
+	return &Urgent{opts: opts, log: opts.Logger, ch: make(chan queued, opts.Queue), m: m,
 		sent: map[string]int{}, asked: map[string]int{}}, nil
+}
+
+// queued is an urgent event and when it joined the queue.
+type queued struct {
+	e  cosmicdust.Event
+	at time.Time
 }
 
 func (u *Urgent) Name() string { return "urgent" }
@@ -121,7 +146,7 @@ func (u *Urgent) Push(e cosmicdust.Event) {
 	u.sent[e.ContainerID] = e.Epoch
 	u.mu.Unlock()
 	select {
-	case u.ch <- e:
+	case u.ch <- queued{e: e, at: u.opts.now()}:
 	default:
 		u.m.result.WithLabelValues("dropped").Inc()
 	}
@@ -154,14 +179,17 @@ func (u *Urgent) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case e := <-u.ch:
-			u.send(ctx, e)
+		case q := <-u.ch:
+			u.send(ctx, q)
 		}
 	}
 }
 
-func (u *Urgent) send(ctx context.Context, e cosmicdust.Event) {
-	b := retry.Backoff{Min: 250 * time.Millisecond, Max: 15 * time.Second}
+// send delivers one event, or gives it up once it has waited MaxAge. The
+// events queued behind it wait meanwhile: what keeps this one from arriving
+// keeps them too.
+func (u *Urgent) send(ctx context.Context, q queued) {
+	e, b := q.e, u.opts.backoff
 	for attempt := 1; ; attempt++ {
 		actx, cancel := context.WithTimeout(ctx, u.opts.Timeout)
 		ack, err := u.opts.Transport.Urgent(actx, e)
@@ -183,11 +211,13 @@ func (u *Urgent) send(ctx context.Context, e cosmicdust.Event) {
 			return
 		}
 		if attempt == 1 {
-			u.log.Warn("urgent event not delivered, retrying", "container", e.Name, "action", e.Action, "err", err)
+			u.log.Warn("urgent event not delivered, waiting for the control plane", "container", e.Name,
+				"action", e.Action, "err", err)
 		}
-		if attempt >= u.opts.Attempts {
+		if u.opts.now().Sub(q.at) >= u.opts.MaxAge {
 			u.m.result.WithLabelValues("failed").Inc()
-			u.log.Warn("urgent event given up; it goes with the events table", "container", e.Name, "action", e.Action)
+			u.log.Warn("urgent event given up; it goes with the events table", "container", e.Name, "action", e.Action,
+				"attempts", attempt)
 			return
 		}
 		if !retry.Sleep(ctx, jitter(b.Next(time.Now()))) {
