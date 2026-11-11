@@ -19,6 +19,10 @@ jobs:
         run: test -z "$(gofmt -l . | tee /dev/stderr)"
       - name: vet
         run: go vet ./...
+      - name: the experiment scripts parse
+        run: |
+          for f in experiments/*.sh experiments/node/entrypoint.sh; do bash -n "$f"; done
+          python3 -m py_compile experiments/analyze.py
       - name: nats-server, for the NATS transport tests
         run: go install github.com/nats-io/nats-server/v2@v2.15.0
       - name: test

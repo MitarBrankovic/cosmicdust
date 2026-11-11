@@ -259,6 +259,7 @@ internal/server/              the server's parts: configs, ledger, receiver, urg
 internal/servertest/          a minimal receiving side of the protocol, for tests
 internal/{metrics,nodeid,fsutil,retry}/   self-metrics endpoint, node identity, atomic writes, reconnect backoff
 deploy/agent/, deploy/server/ Dockerfiles and compose files
+experiments/                  the system on one machine, with several nodes, run N times: statistics and charts
 ```
 
 ## Development
@@ -270,6 +271,7 @@ make integration      # lifecycle and tailer scenarios against the node's docker
 ES_ADDRESS=http://localhost:9200 make integration-es   # the indexer and the query API against Elasticsearch
 make build            # bin/cosmicdust-{agent,server}-{amd64,arm64}
 make proto            # regenerate pkg/api from pkg/api/proto
+make experiments N=5   # every scenario of experiments/ five times, then statistics and charts
 ```
 
 The crash tests kill the process that reads and stores with `SIGKILL` again and again while the log keeps growing,
