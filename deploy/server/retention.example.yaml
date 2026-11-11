@@ -1,0 +1,22 @@
+# How long the logs and events of each application are kept.
+#   search:  in Elasticsearch, where they are searched (the data stream's lifecycle)
+#   archive: in the Parquet archive, the long and cheap copy
+# Durations take d (days), h, m and s: 30d, 12h. An application that is not
+# listed gets the default, and so does every field an application leaves out.
+# The application of a line is what the node puts in its app column: a
+# container label, else the Compose service, else the image.
+
+default:
+  logs:   {search: 7d,  archive: 30d}
+  events: {search: 30d, archive: 90d}
+
+# The copies of urgent events (a container that died with an error or for
+# memory) in their own stream; the events themselves also arrive with the
+# events table and keep its retention.
+urgent: 7d
+
+apps:
+  shop.api:
+    logs: {search: 3d, archive: 14d}
+  billing:
+    events: {archive: 365d}
