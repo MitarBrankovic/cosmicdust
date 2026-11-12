@@ -34,3 +34,6 @@ go.work.sum
 
 # Build output
 /bin/
+
+# Results of the experiments
+/experiments/results/
