@@ -116,19 +116,19 @@ def chart(values, metric, label, out):
     for n, scenario in enumerate(scenarios):
         xs, medians, lows, highs = [], [], [], []
         # Scenarios side by side at each size, so that their bars do not hide each other.
-        shift = (n - (len(scenarios) - 1) / 2) * 0.08
-        for i, k in enumerate(sizes):
+        shift = (n - (len(scenarios) - 1) / 2) * 0.12
+        for k in sizes:
             v = values.get((scenario, k, metric))
             if not v:
                 continue
             m = statistics.median(v)
-            xs.append(i + shift)
+            xs.append(k + shift)
             medians.append(m)
             lows.append(m - min(v))
             highs.append(max(v) - m)
-            ax.scatter([i + shift] * len(v), v, s=10, color=f"C{n}", alpha=0.35, zorder=2)
+            ax.scatter([k + shift] * len(v), v, s=10, color=f"C{n}", alpha=0.35, zorder=2)
         ax.errorbar(xs, medians, yerr=[lows, highs], marker="o", capsize=3, color=f"C{n}", label=scenario, zorder=3)
-    ax.set_xticks(range(len(sizes)), [str(k) for k in sizes])
+    ax.set_xticks(sizes, [str(k) for k in sizes])
     ax.set_xlabel("nodes")
     ax.set_ylabel(label)
     ax.set_ylim(bottom=0, top=top * 1.15 if top > 0 else 1)
