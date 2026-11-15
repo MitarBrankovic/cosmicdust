@@ -6,8 +6,12 @@
 //
 // A generator numbers its lines from 1 (experiments/cmd/loggen), so for each
 // of a node's generators the lines 1..count must each come back once. The
-// generators are the ones whose id contains -match; lines of anything else
-// are counted apart. One line per node is printed:
+// generators are the ones whose id contains -match; -also names more of them,
+// with a count of their own:
+//
+//	verify -generators 5 -count 6000 -also /b=5x18000 node-1
+//
+// Lines of anything else are counted apart. One line per node is printed:
 //
 //	node=node-1 generators=5 lines=30000 missing=0 duplicate=0 other=0 pages=31 seconds=1.2
 //
@@ -44,13 +48,43 @@ func parse(line string) (gen string, seq int, ok bool) {
 	return gen, seq, err == nil
 }
 
+// A group is the generators of a node that wrote the same number of lines:
+// the ones whose id contains match.
+type group struct {
+	match      string
+	generators int
+	count      int
+}
+
+// parseGroup reads "<match>=<generators>x<count>".
+func parseGroup(v string) (group, error) {
+	match, rest, ok := strings.Cut(v, "=")
+	gens, count, ok2 := strings.Cut(rest, "x")
+	g := group{match: match}
+	var err1, err2 error
+	g.generators, err1 = strconv.Atoi(gens)
+	g.count, err2 = strconv.Atoi(count)
+	if !ok || !ok2 || match == "" || err1 != nil || err2 != nil || g.generators < 1 || g.count < 1 {
+		return g, fmt.Errorf("%q is not <match>=<generators>x<count>", v)
+	}
+	return g, nil
+}
+
 type result struct {
 	generators, lines, missing, duplicate, other, pages int
 }
 
-func check(ctx context.Context, q api.QueryClient, node, match string, generators, count, page int) (result, error) {
+func check(ctx context.Context, q api.QueryClient, node string, groups []group, page int) (result, error) {
 	var r result
 	seen := map[string][]bool{}
+	of := func(gen string) int {
+		for i, g := range groups {
+			if strings.Contains(gen, g.match) {
+				return i
+			}
+		}
+		return -1
+	}
 	req := &api.GetLogsRequest{Node: node, PageSize: int32(page)}
 	for {
 		out, err := q.GetLogs(ctx, req)
@@ -60,12 +94,16 @@ func check(ctx context.Context, q api.QueryClient, node, match string, generator
 		r.pages++
 		for _, l := range out.Lines {
 			gen, seq, ok := parse(l.Line)
-			if !ok || !strings.Contains(gen, match) || seq < 1 || seq > count {
+			g := -1
+			if ok {
+				g = of(gen)
+			}
+			if g < 0 || seq < 1 || seq > groups[g].count {
 				r.other++
 				continue
 			}
 			if seen[gen] == nil {
-				seen[gen] = make([]bool, count+1)
+				seen[gen] = make([]bool, groups[g].count+1)
 			}
 			if seen[gen][seq] {
 				r.duplicate++
@@ -80,7 +118,17 @@ func check(ctx context.Context, q api.QueryClient, node, match string, generator
 		req.PageToken = out.NextPageToken
 	}
 	r.generators = len(seen)
-	r.missing = max(generators, len(seen))*count - r.lines
+	// What should be there: every group's lines, of as many generators as
+	// expected - or as were seen, if there were more.
+	found := make([]int, len(groups))
+	for gen := range seen {
+		found[of(gen)]++
+	}
+	want := 0
+	for i, g := range groups {
+		want += max(g.generators, found[i]) * g.count
+	}
+	r.missing = want - r.lines
 	return r, nil
 }
 
@@ -92,12 +140,21 @@ func main() {
 		match      = flag.String("match", "/c", "a generator is a line source whose id contains this")
 		page       = flag.Int("page", 1000, "lines asked for at a time")
 		timeout    = flag.Duration("timeout", 10*time.Minute, "give up after this long")
+		also       []group
 	)
+	flag.Func("also", "more generators of every node, as <match>=<generators>x<count>; may be repeated", func(v string) error {
+		g, err := parseGroup(v)
+		if err == nil {
+			also = append(also, g)
+		}
+		return err
+	})
 	flag.Parse()
 	if *count <= 0 || flag.NArg() == 0 {
 		fmt.Fprintln(os.Stderr, "usage: verify -count <lines per generator> [flags] <node>...")
 		os.Exit(2)
 	}
+	groups := append([]group{{match: *match, generators: *generators, count: *count}}, also...)
 	conn, err := grpc.NewClient(*server, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "verify:", err)
@@ -110,7 +167,7 @@ func main() {
 	exact := true
 	for _, node := range flag.Args() {
 		start := time.Now()
-		r, err := check(ctx, api.NewQueryClient(conn), node, *match, *generators, *count, *page)
+		r, err := check(ctx, api.NewQueryClient(conn), node, groups, *page)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "verify: node %s: %v\n", node, err)
 			os.Exit(2)

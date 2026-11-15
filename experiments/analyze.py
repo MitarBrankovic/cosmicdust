@@ -44,6 +44,17 @@ EXPERIMENTS = {
             "settle_s": "until every line is searchable (s)",
         },
     },
+    "adverse": {
+        "axis": "nodes",
+        "charts": {
+            "settle_s": "until every line is searchable or accounted for (s)",
+            "agent_cpu_pct": "agent CPU, mean of the nodes (% of one core)",
+            "agent_cpu_pct_max": "agent CPU, the busiest node (% of one core)",
+            "agent_rss_mb_max": "agent memory, the largest node (MB resident)",
+            "dropped_pct": "lines dropped for room, each drop recorded (%)",
+            "link_lost_pct": "packets the narrow link lost (%)",
+        },
+    },
     "compare": {
         "axis": "case",
         "order": ["idle0", "idle200", "load1k", "load5k", "load10k", "edge25", "edge10"],

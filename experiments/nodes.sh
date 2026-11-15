@@ -1,26 +1,40 @@
-# The experiment "nodes": the whole system with several nodes. Sourced by
-# run.sh after lib.sh.
+# The experiments "nodes" and "adverse": the whole system with several nodes.
+# Sourced by run.sh after lib.sh.
 #
 # A run starts the server and k nodes, lets every node's generators write
 # CONTAINERS x RATE lines a second for DURATION seconds, waits until every
 # line is searchable, reads all of them back through the query API, and
 # records what the agents and the server cost meanwhile. The axis is the
 # number of nodes; a series is a scenario, which is what happens while the
-# generators write:
+# generators write.
+#
+# nodes - the system as it is meant to run:
 #
 #   steady   nothing: the cost of the system under a steady load
 #   outage   the server is away for most of the load, and containers fail
 #            meanwhile; it returns once the load is over
 #   churn    every few seconds the agent of one node is killed (kill -9) and
 #            started again, node after node
+#
+# adverse - what a node at the edge has to live with:
+#
+#   narrow   outage, with every node behind a narrow link that loses packets
+#            (LINK_MBIT, LINK_RTT, LINK_LOSS): what waited crosses it
+#   burst    for the middle third of the load, BURST_X times as many lines
+#   evict    the server is away for the whole load and the agent's store may
+#            hold STORE_QUOTA: the agent drops its oldest logs for room and
+#            records each drop; every line must be either there or recorded
+#   block    the same, with the agent told to stop reading instead: once the
+#            server is back, every line must be there
 
 : "${SCENARIOS:=steady,outage,churn}"
+: "${ADVERSE:=narrow,burst,evict,block}"
 : "${NODES:=1,3,5,10}"
 
-# nodes_units lists the runs of a round: "<nodes> <scenario>".
-nodes_units() {
+# units_of lists the runs of a round over some scenarios: "<nodes> <scenario>".
+units_of() { # <scenarios>
 	local s k
-	for s in ${SCENARIOS//,/ }; do
+	for s in ${1//,/ }; do
 		declare -F "during_$s" >/dev/null || die "there is no scenario '$s'"
 		for k in ${NODES//,/ }; do
 			echo "$k $s"
@@ -28,9 +42,19 @@ nodes_units() {
 	done
 }
 
-# during_<scenario> runs while the generators write and returns when the
-# scenario's part is over. It may add to EXTRA the lines written by anything
-# but the generators.
+nodes_units() { units_of "$SCENARIOS"; }
+adverse_units() { units_of "$ADVERSE"; }
+
+# A scenario is up to four functions, of which only the third is a must:
+#
+#   setup_<scenario>    before the nodes start; may set NODE_ARGS
+#   before_<scenario>   the nodes are up, no line is written yet
+#   during_<scenario>   while the generators write; returns when the
+#                       scenario's part is over
+#   after_<scenario>    every line is searchable
+#
+# They may set EXTRA (lines written by anything but the generators that
+# nodes_run starts), ALSO and ALSO_LINES, MAY_DROP and MAY_MISS (lib.sh).
 
 during_steady() {
 	sleep "$DURATION"
@@ -83,17 +107,103 @@ during_churn() {
 	emit agent_kills "$kills"
 }
 
+before_narrow() {
+	local i
+	for i in $(seq 1 "$K"); do
+		link_shape "$i"
+	done
+}
+
+during_narrow() {
+	during_outage
+}
+
+after_narrow() {
+	local mb lost
+	after_outage
+	read -r mb lost < <(link_stats "$K")
+	emit link_mb "$mb"
+	emit link_lost_pct "$lost"
+}
+
+# The burst comes from generators of its own, CONTAINERS more on every node,
+# which together with the first ones write BURST_X times the load.
+during_burst() {
+	local third=$((DURATION / 3)) rate=$((RATE * (BURST_X - 1))) count
+	count=$((rate * third))
+	sleep "$third"
+	generators_start "$K" "$count" b "$rate"
+	sleep $((DURATION - third))
+	# A node that could not keep up with the burst is still writing.
+	generators_wait "$K"
+	EXTRA=$((K * CONTAINERS * count))
+	ALSO="-also /b=${CONTAINERS}x$count" ALSO_LINES=$((CONTAINERS * count))
+	emit burst_lines_per_s $((K * CONTAINERS * RATE * BURST_X))
+}
+
+# A full store: the server is away from before the first line until five
+# seconds after the last, and the store has room for a part of the load only.
+setup_evict() {
+	NODE_ARGS=(-e "COSMICDUST_STORE_QUOTA=$STORE_QUOTA" -e COSMICDUST_WHEN_FULL=evict)
+	MAY_DROP=$K
+}
+
+setup_block() {
+	NODE_ARGS=(-e "COSMICDUST_STORE_QUOTA=$STORE_QUOTA" -e COSMICDUST_WHEN_FULL=block)
+}
+
+before_evict() {
+	server_stop
+	AWAY=$(date +%s.%N)
+}
+
+before_block() {
+	before_evict
+}
+
+during_evict() {
+	sleep $((DURATION + 5))
+	server_start "$RUN" "$PREFIX"
+	emit outage_s "$(since "$AWAY")"
+}
+
+during_block() {
+	during_evict
+}
+
+# What the agents say about their stores: how often reading had to wait for
+# room, and how many lines were dropped for it. Those lines are rightly
+# missing; any other is not.
+after_evict() {
+	local dropped
+	dropped=$(agents_sum "$K" cosmicdust_agent_store_dropped_rows_total)
+	emit store_full_times "$(agents_sum "$K" cosmicdust_agent_store_full_total)"
+	emit lines_dropped "$dropped"
+	emit dropped_pct "$(awk -v d="$dropped" -v n="$((K * CONTAINERS * RATE * DURATION))" 'BEGIN { printf "%.1f", 100 * d / n }')"
+	MAY_MISS=$dropped
+}
+
+after_block() {
+	after_evict
+}
+
 # nodes_run is one run of a scenario with k nodes.
-nodes_run() { # <k> <scenario> <round>
+nodes_run() { # <k> <scenario> <round> [experiment]
 	K=$1
 	local scenario=$2 count=$((RATE * DURATION)) nodes=() i from to before after settle failed=0
 	local expected=$((K * CONTAINERS * count))
-	EXTRA=0
-	begin nodes "$K" "$scenario" "$3"
-	log "nodes: $scenario, $K node(s), round $3: $((K * CONTAINERS * RATE)) lines/s for $DURATION s"
+	EXTRA=0 NODE_ARGS=() ALSO='' ALSO_LINES=0 MAY_DROP='' MAY_MISS=0
+	begin "${4:-nodes}" "$K" "$scenario" "$3"
+	log "$EXPERIMENT: $scenario, $K node(s), round $3: $((K * CONTAINERS * RATE)) lines/s for $DURATION s"
 
+	if declare -F "setup_$scenario" >/dev/null; then
+		"setup_$scenario"
+	fi
 	server_start "$RUN" "$PREFIX"
 	nodes_start "$K"
+	if declare -F "before_$scenario" >/dev/null; then
+		"before_$scenario"
+	fi
 	sample_start "$K" "$RUN/samples.csv"
 	from=$(date +%s.%N) before=$(machine)
 	generators_start "$K" "$count"
@@ -112,6 +222,7 @@ nodes_run() { # <k> <scenario> <round>
 	sample_stop
 
 	emit lines_per_s $((K * CONTAINERS * RATE))
+	emit scenario_s "$(awk -v a="$from" -v b="$to" 'BEGIN { printf "%.1f", b - a }')"
 	for i in $(seq 1 "$K"); do
 		nodes+=("node-$i")
 	done
@@ -143,4 +254,8 @@ nodes_run() { # <k> <scenario> <round>
 		done
 	fi
 	finish
+}
+
+adverse_run() { # <k> <scenario> <round>
+	nodes_run "$1" "$2" "$3" adverse
 }

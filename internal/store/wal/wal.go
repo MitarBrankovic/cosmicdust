@@ -612,7 +612,13 @@ func (w *WAL) tick() {
 	if w.failed && !w.p.empty() {
 		if err := w.flushLocked(); err != nil {
 			w.log.Debug("the pending WAL block still cannot be written", "err", err)
-			return
+			// With the disk full there is nothing to seal into. Held by the
+			// store, the WAL still seals a segment that is old enough: the
+			// store finds room by converting what the WAL holds, and what
+			// sits in an open segment cannot be converted.
+			if !w.held {
+				return
+			}
 		}
 	}
 	if w.size > 0 && (w.rollPending || time.Since(w.opened) >= w.opts.SegmentAge) {
