@@ -1,4 +1,4 @@
-.PHONY: test lint integration integration-es build proto
+.PHONY: test lint integration integration-es build proto experiments
 
 # Unit tests under the race detector. The NATS transport tests start a
 # nats-server from PATH and are skipped without one:
@@ -42,3 +42,10 @@ build:
 # protoc-gen-go-grpc on PATH.
 proto:
 	go generate ./pkg/api/...
+
+# Every scenario of experiments/ N times, then the statistics and the charts
+# (experiments/README.md). Takes a machine that does nothing else, Docker that
+# runs privileged containers, and a Python with matplotlib.
+N ?= 3
+experiments:
+	experiments/run.sh -n $(N)
