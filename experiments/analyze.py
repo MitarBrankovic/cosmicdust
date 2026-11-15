@@ -5,12 +5,14 @@
 
 Reads runs.csv (one line per run and measured value) and writes, next to it,
 
-    summary.csv   per scenario, number of nodes and value: how many runs, the
-                  median, the mean, the standard deviation, the least and the
-                  most
-    figures/      one chart per value, as PNG and as PDF: the median against
-                  the number of nodes, a line per scenario, with the range of
-                  the runs as bars and every run as a dot
+    summary.csv   per experiment, place on its axis, series and value: how
+                  many runs, the median, the mean, the standard deviation, the
+                  least and the most
+    figures/      one chart per experiment and value, as PNG and as PDF: the
+                  median, with the range of the runs as bars and every run as
+                  a dot. Where the axis is a number (nodes, lines per second)
+                  the chart is a line per series; where it is a name (a case)
+                  it is a group of bars per name
 
 and prints the summary. A value measured once has no deviation; the charts
 then show the single run.
@@ -27,15 +29,41 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-# The values that get a chart, with what the axis says.
-CHARTS = {
-    "agent_cpu_pct": "agent CPU, mean of the nodes (% of one core)",
-    "agent_cpu_pct_max": "agent CPU, the busiest node (% of one core)",
-    "agent_rss_mb": "agent memory, mean of the nodes (MB resident)",
-    "agent_rss_mb_max": "agent memory, the largest node (MB resident)",
-    "server_cpu_pct": "server CPU (% of one core)",
-    "server_rss_mb": "server memory (MB resident)",
-    "settle_s": "until every line is searchable (s)",
+# Per experiment: what its axis is, the order of its places if they are
+# names, and the values that get a chart, with what the chart's axis says.
+EXPERIMENTS = {
+    "nodes": {
+        "axis": "nodes",
+        "charts": {
+            "agent_cpu_pct": "agent CPU, mean of the nodes (% of one core)",
+            "agent_cpu_pct_max": "agent CPU, the busiest node (% of one core)",
+            "agent_rss_mb": "agent memory, mean of the nodes (MB resident)",
+            "agent_rss_mb_max": "agent memory, the largest node (MB resident)",
+            "server_cpu_pct": "server CPU (% of one core)",
+            "server_rss_mb": "server memory (MB resident)",
+            "settle_s": "until every line is searchable (s)",
+        },
+    },
+    "compare": {
+        "axis": "case",
+        "order": ["idle0", "idle200", "load1k", "load5k", "load10k", "edge25", "edge10"],
+        "charts": {
+            "collector_cpu_pct": "CPU of the collector (% of one core)",
+            "collector_anon_mb": "anonymous memory of the collector (MB)",
+            "collector_peak_mb": "memory of the collector at its largest, page cache included (MB)",
+            "runtime_cpu_pct": "CPU of the node's runtime: dockerd, containerd, shims (% of one core)",
+            "cpu_s_per_gb": "CPU seconds of the collector per GB of logs",
+        },
+    },
+    "ceiling": {
+        "axis": "lines per second",
+        "charts": {
+            "collector_cpu_pct": "CPU of the agent (% of one core)",
+            "behind_pct": "lines not yet searchable when the last one is written (%)",
+            "settle_s": "until every line is searchable (s)",
+            "runtime_cpu_pct": "CPU of the node's runtime: dockerd, containerd, shims (% of one core)",
+        },
+    },
 }
 
 # The values that are not measurements but outcomes: shown as "k of n runs".
@@ -43,7 +71,7 @@ OUTCOMES = ("exactly_once", "failed")
 
 
 def load(path):
-    """runs.csv as {(scenario, nodes, metric): [values in the order of the rounds]}."""
+    """runs.csv as {(experiment, x, series, metric): [values in the order of the rounds]}."""
     values = defaultdict(list)
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
@@ -51,23 +79,33 @@ def load(path):
                 value = float(row["value"])
             except ValueError:
                 continue
-            values[(row["scenario"], int(row["nodes"]), row["metric"])].append(value)
+            values[(row["experiment"], row["x"], row["series"], row["metric"])].append(value)
     return values
+
+
+def numeric(xs):
+    try:
+        return [float(x) for x in xs] is not None
+    except ValueError:
+        return False
+
+
+def places(experiment, xs):
+    """The places of an experiment's axis, in the order they are shown."""
+    xs = set(xs)
+    if numeric(xs):
+        return sorted(xs, key=float)
+    order = EXPERIMENTS.get(experiment, {}).get("order", [])
+    return [x for x in order if x in xs] + sorted(xs - set(order))
 
 
 def summarize(values):
     rows = []
-    for (scenario, nodes, metric), v in sorted(values.items()):
+    for (experiment, x, series, metric), v in values.items():
         rows.append({
-            "scenario": scenario,
-            "nodes": nodes,
-            "metric": metric,
-            "runs": len(v),
-            "median": statistics.median(v),
-            "mean": statistics.fmean(v),
-            "stdev": statistics.stdev(v) if len(v) > 1 else 0.0,
-            "min": min(v),
-            "max": max(v),
+            "experiment": experiment, "x": x, "series": series, "metric": metric, "runs": len(v),
+            "median": statistics.median(v), "mean": statistics.fmean(v),
+            "stdev": statistics.stdev(v) if len(v) > 1 else 0.0, "min": min(v), "max": max(v),
         })
     return rows
 
@@ -76,67 +114,83 @@ def number(x):
     return f"{x:.0f}" if abs(x) >= 1000 or float(x).is_integer() else f"{x:.3g}"
 
 
-def write_summary(rows, path):
+def write_summary(rows, values, path):
+    fields = ["experiment", "x", "series", "metric", "runs", "median", "mean", "stdev", "min", "max"]
+    order = {e: places(e, [x for (ee, x, _, _) in values if ee == e]) for e in {r["experiment"] for r in rows}}
+    rows = sorted(rows, key=lambda r: (r["experiment"], order[r["experiment"]].index(r["x"]), r["series"], r["metric"]))
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["scenario", "nodes", "metric", "runs", "median", "mean", "stdev", "min", "max"])
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in rows:
             w.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v) for k, v in r.items()})
 
 
-def print_summary(rows, values):
-    scenarios = sorted({r["scenario"] for r in rows})
-    for scenario in scenarios:
-        sizes = sorted({r["nodes"] for r in rows if r["scenario"] == scenario})
-        print(f"\n{scenario}")
-        print(f"  {'':34}" + "".join(f"{f'{k} node(s)':>22}" for k in sizes))
-        for metric in OUTCOMES:
-            cells = []
-            for k in sizes:
-                v = values.get((scenario, k, metric), [])
-                cells.append(f"{int(sum(v))} of {len(v)} runs" if v else "-")
-            print(f"  {metric:34}" + "".join(f"{c:>22}" for c in cells))
-        metrics = sorted({r["metric"] for r in rows if r["scenario"] == scenario and r["metric"] not in OUTCOMES})
-        for metric in metrics:
-            cells = []
-            for k in sizes:
-                r = next((r for r in rows if (r["scenario"], r["nodes"], r["metric"]) == (scenario, k, metric)), None)
-                cells.append(f"{number(r['median'])} [{number(r['min'])}..{number(r['max'])}]" if r else "-")
-            print(f"  {metric:34}" + "".join(f"{c:>22}" for c in cells))
+def print_summary(values):
+    for experiment in sorted({e for (e, _, _, _) in values}):
+        axis = EXPERIMENTS.get(experiment, {}).get("axis", "x")
+        xs = places(experiment, [x for (e, x, _, _) in values if e == experiment])
+        for series in sorted({s for (e, _, s, _) in values if e == experiment}):
+            print(f"\n{experiment}: {series}")
+            print(f"  {axis:34}" + "".join(f"{x:>22}" for x in xs))
+            metrics = sorted({m for (e, _, s, m) in values if e == experiment and s == series})
+            for metric in [m for m in OUTCOMES if m in metrics] + [m for m in metrics if m not in OUTCOMES]:
+                cells = []
+                for x in xs:
+                    v = values.get((experiment, x, series, metric))
+                    if not v:
+                        cells.append("-")
+                    elif metric in OUTCOMES:
+                        cells.append(f"{int(sum(v))} of {len(v)} runs")
+                    else:
+                        cells.append(f"{number(statistics.median(v))} [{number(min(v))}..{number(max(v))}]")
+                print(f"  {metric:34}" + "".join(f"{c:>22}" for c in cells))
     print("\n  median [least..most] over the runs")
 
 
-def chart(values, metric, label, out):
-    scenarios = sorted({s for (s, _, m) in values if m == metric})
-    if not scenarios:
+def chart(values, experiment, metric, label, out):
+    keys = [(x, s) for (e, x, s, m) in values if e == experiment and m == metric]
+    if not keys:
         return False
-    fig, ax = plt.subplots(figsize=(6.4, 4.0))
-    sizes = sorted({k for (_, k, m) in values if m == metric})
-    top = max(max(v) for (_, _, m), v in values.items() if m == metric)
-    for n, scenario in enumerate(scenarios):
-        xs, medians, lows, highs = [], [], [], []
-        # Scenarios side by side at each size, so that their bars do not hide each other.
-        shift = (n - (len(scenarios) - 1) / 2) * 0.12
-        for k in sizes:
-            v = values.get((scenario, k, metric))
+    xs = places(experiment, [x for x, _ in keys])
+    series = sorted({s for _, s in keys})
+    lines = numeric(xs)
+    top = max(max(values[(experiment, x, s, metric)]) for x, s in keys)
+    fig, ax = plt.subplots(figsize=(6.4, 4.0) if lines else (max(6.4, 1.1 * len(xs) + 2), 4.0))
+    width = 0.8 / len(series)
+    for n, name in enumerate(series):
+        at, medians, lows, highs = [], [], [], []
+        for i, x in enumerate(xs):
+            v = values.get((experiment, x, name, metric))
             if not v:
                 continue
             m = statistics.median(v)
-            xs.append(k + shift)
+            # Series side by side at each place, so that they do not hide each other.
+            if lines:
+                span = (float(xs[-1]) - float(xs[0])) or 1.0
+                pos = float(x) + (n - (len(series) - 1) / 2) * span * 0.012
+            else:
+                pos = i + (n - (len(series) - 1) / 2) * width
+            at.append(pos)
             medians.append(m)
             lows.append(m - min(v))
             highs.append(max(v) - m)
-            ax.scatter([k + shift] * len(v), v, s=10, color=f"C{n}", alpha=0.35, zorder=2)
-        ax.errorbar(xs, medians, yerr=[lows, highs], marker="o", capsize=3, color=f"C{n}", label=scenario, zorder=3)
-    ax.set_xticks(sizes, [str(k) for k in sizes])
-    ax.set_xlabel("nodes")
+            ax.scatter([pos] * len(v), v, s=10, color="black" if not lines else f"C{n}", alpha=0.35, zorder=4)
+        if lines:
+            ax.errorbar(at, medians, yerr=[lows, highs], marker="o", capsize=3, color=f"C{n}", label=name, zorder=3)
+        else:
+            ax.bar(at, medians, width=width * 0.9, yerr=[lows, highs], capsize=3, color=f"C{n}", label=name, zorder=3)
+    if lines:
+        ax.set_xticks([float(x) for x in xs], xs)
+    else:
+        ax.set_xticks(range(len(xs)), xs)
+    ax.set_xlabel(EXPERIMENTS.get(experiment, {}).get("axis", "x"))
     ax.set_ylabel(label)
     ax.set_ylim(bottom=0, top=top * 1.15 if top > 0 else 1)
     ax.grid(axis="y", alpha=0.3)
     ax.legend(title="median, range of the runs", frameon=False)
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        fig.savefig(out / f"{metric}.{ext}", dpi=150)
+        fig.savefig(out / f"{experiment}-{metric}.{ext}", dpi=150)
     plt.close(fig)
     return True
 
@@ -148,13 +202,15 @@ def main():
     values = load(results / "runs.csv")
     if not values:
         sys.exit(f"{results / 'runs.csv'} has no runs")
-    rows = summarize(values)
-    write_summary(rows, results / "summary.csv")
+    write_summary(summarize(values), values, results / "summary.csv")
     figures = results / "figures"
     figures.mkdir(exist_ok=True)
-    drawn = [m for m, label in CHARTS.items() if chart(values, m, label, figures)]
-    print_summary(rows, values)
-    print(f"\n  {results / 'summary.csv'}; {len(drawn)} charts in {figures}")
+    drawn = 0
+    for experiment, spec in EXPERIMENTS.items():
+        for metric, label in spec["charts"].items():
+            drawn += chart(values, experiment, metric, label, figures)
+    print_summary(values)
+    print(f"\n  {results / 'summary.csv'}; {drawn} charts in {figures}")
 
 
 if __name__ == "__main__":
