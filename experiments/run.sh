@@ -1,48 +1,63 @@
 #!/usr/bin/env bash
-# Runs the experiments: every scenario, with every number of nodes, as many
-# times as asked, and then the statistics and the charts over all the runs.
+# Runs the experiments: every run of every experiment as many times as asked,
+# and then the statistics and the charts over all of them.
 #
-#   experiments/run.sh -n 5                      every scenario, 1, 3, 5 and 10 nodes, five times each
-#   experiments/run.sh -n 3 -s steady -k 1,5     one scenario, two sizes
-#   experiments/run.sh -q                        a quick pass, to see that everything works
-#   experiments/run.sh -n 5 -o <directory>       continue a session that was interrupted
+#   experiments/run.sh -n 5                    every experiment, five times each run
+#   experiments/run.sh -n 5 -e nodes           only the system with several nodes
+#   experiments/run.sh -n 3 -e compare         only the agent against Fluent Bit and Vector
+#   experiments/run.sh -q                      a quick pass, to see that everything works
+#   experiments/run.sh -n 5 -o <directory>     continue a session that was interrupted
 #
-#   -n <rounds>     how many times every scenario runs (default 3)
-#   -s <scenarios>  steady, outage, churn; comma separated (default all)
-#   -k <nodes>      numbers of nodes, comma separated (default 1,3,5,10)
-#   -o <directory>  where the results go (default experiments/results/<time>);
-#                   runs already there are not repeated
-#   -q              quick: 2 generators of 50 lines/s for 20 s on every node
+#   -n <rounds>       how many times every run is made (default 3)
+#   -e <experiments>  nodes, compare, ceiling; comma separated (default all)
+#   -s <scenarios>    nodes: steady, outage, churn (default all)
+#   -k <nodes>        nodes: numbers of nodes (default 1,3,5,10)
+#   -o <directory>    where the results go (default experiments/results/<time>);
+#                     runs already there are not repeated
+#   -q                quick: short runs, small loads, two cases
 #
-# The load and the nodes are set from the environment: CONTAINERS, RATE,
-# DURATION, NODE_CPUS, NODE_MEM (see lib.sh). ES_ADDRESS names an
-# Elasticsearch to use instead of starting one; PYTHON a Python with
-# matplotlib.
+# The experiments:
 #
-# In every round each scenario and size runs once, and each round starts one
-# place further down the list, so that no scenario always follows the same
-# one. The results:
+#   nodes    the whole system with 1 to 10 nodes: steady load, the server
+#            away, agents killed (nodes.sh)
+#   compare  the agent against Fluent Bit and Vector on one node, each under
+#            the same limits (collectors.sh; CASES, SUBJECTS)
+#   ceiling  the agent under growing loads (collectors.sh; LOADS)
+#
+# The rest is set from the environment (lib.sh, collectors.sh): CONTAINERS,
+# RATE, DURATION, NODE_CPUS, NODE_MEM, REPLAY, ES_ADDRESS, PYTHON.
+#
+# In every round each run is made once, and each round starts one place
+# further down the list, so that no run always follows the same one. The
+# results:
 #
 #   runs.csv      one line per run and measured value
-#   summary.csv   per scenario, size and value: median, mean, deviation, range
+#   summary.csv   per experiment, place on its axis, series and value: median,
+#                 mean, deviation, range
 #   figures/      the charts, as PNG and PDF
 #   runs/         what each run left: samples, the verifier's answer, logs
 set -u
 
+quick_cases=${CASES-} quick_loads=${LOADS-}
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-. "$EXP/scenarios.sh"
+. "$EXP/nodes.sh"
+. "$EXP/collectors.sh"
 
 ROUNDS=3
-SCENARIOS=steady,outage,churn
-NODES=1,3,5,10
+EXPERIMENTS=nodes,compare,ceiling
 OUT=
-while getopts "n:s:k:o:qh" opt; do
+while getopts "n:e:s:k:o:qh" opt; do
 	case $opt in
 	n) ROUNDS=$OPTARG ;;
+	e) EXPERIMENTS=$OPTARG ;;
 	s) SCENARIOS=$OPTARG ;;
 	k) NODES=$OPTARG ;;
 	o) OUT=$OPTARG ;;
-	q) CONTAINERS=2 RATE=50 DURATION=20 ;;
+	q)
+		QUICK=1 CONTAINERS=2 RATE=50 DURATION=20
+		[ -n "$quick_cases" ] || CASES="idle0 load1k"
+		[ -n "$quick_loads" ] || LOADS="10x100"
+		;;
 	*)
 		sed -n '2,/^set -u/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
 		exit 2
@@ -53,15 +68,23 @@ done
 mkdir -p "$OUT/done" "$OUT/runs"
 OUT=$(cd "$OUT" && pwd)
 
-pairs=()
-for s in ${SCENARIOS//,/ }; do
-	declare -F "during_$s" >/dev/null || die "there is no scenario '$s'"
-	for k in ${NODES//,/ }; do
-		pairs+=("$s $k")
-	done
+# The runs of a round: "<experiment> <place on the axis> <series> [what the
+# experiment needs to make it]".
+units=()
+for e in ${EXPERIMENTS//,/ }; do
+	declare -F "${e}_units" >/dev/null || die "there is no experiment '$e'"
+	while read -r line; do
+		units+=("$e $line")
+	done < <("${e}_units")
 done
+[ "${#units[@]}" -gt 0 ] || die "nothing to run"
 
 need
+case ",$EXPERIMENTS," in
+*,compare,*)
+	case " $SUBJECTS " in *" vector "*) command -v zstdcat >/dev/null || die "zstdcat is not installed (Vector's output is counted with it)" ;; esac
+	;;
+esac
 build
 es_up
 net_up
@@ -71,9 +94,11 @@ trap 'exit 130' INT TERM
 {
 	echo "date: $(date -Is)"
 	echo "commit: $(git -C "$REPO" describe --always --dirty 2>/dev/null)"
-	echo "rounds: $ROUNDS; scenarios: $SCENARIOS; nodes: $NODES"
-	echo "load per node: $CONTAINERS generators x $RATE lines/s for $DURATION s"
-	echo "node: $NODE_CPUS CPU, $NODE_MEM memory"
+	echo "rounds: $ROUNDS; experiments: $EXPERIMENTS"
+	echo "nodes: scenarios $SCENARIOS; sizes $NODES; per node $CONTAINERS generators x $RATE lines/s for $DURATION s; $NODE_CPUS CPU, $NODE_MEM"
+	echo "compare: cases $CASES; collectors $SUBJECTS ($FLUENT_BIT_IMAGE, $VECTOR_IMAGE)"
+	echo "ceiling: loads $LOADS"
+	echo "generators write: ${REPLAY:-filler}"
 	echo "go: $(go version | cut -d' ' -f3-)"
 	echo "docker: $(docker version --format '{{.Server.Version}}'); node image: $DIND"
 	echo "elasticsearch: $(curl -fs "$ES_ADDRESS" | sed -n 's/.*"number" *: *"\([^"]*\)".*/\1/p')"
@@ -82,18 +107,18 @@ trap 'exit 130' INT TERM
 	echo "memory: $(awk '/MemTotal/ { printf "%.1f GB", $2 / 1e6 }' /proc/meminfo)"
 } >>"$OUT/env.txt"
 
-[ -f "$OUT/runs.csv" ] || echo "scenario,nodes,round,metric,value" >"$OUT/runs.csv"
+[ -f "$OUT/runs.csv" ] || echo "experiment,x,series,round,metric,value" >"$OUT/runs.csv"
 for round in $(seq 1 "$ROUNDS"); do
-	for i in $(seq 0 $((${#pairs[@]} - 1))); do
-		pair=${pairs[$(((i + round - 1) % ${#pairs[@]}))]}
-		s=${pair% *} k=${pair#* }
-		[ -e "$OUT/done/$s-k$k-r$round" ] && continue
+	for i in $(seq 0 $((${#units[@]} - 1))); do
+		read -r e x series arg <<<"${units[$(((i + round - 1) % ${#units[@]}))]}"
+		[ -e "$OUT/done/$e-$x-$series-r$round" ] && continue
 		# In a shell of its own: a run that cannot go on ends there, and the
 		# session continues with the next one.
 		(
 			trap teardown EXIT
-			run_one "$s" "$k" "$round"
-		) || log "$s with $k node(s), round $round did not finish"
+			# shellcheck disable=SC2086
+			"${e}_run" "$x" "$series" "$round" $arg
+		) || log "$e $x $series, round $round did not finish"
 	done
 done
 

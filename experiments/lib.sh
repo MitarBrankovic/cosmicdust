@@ -1,5 +1,5 @@
-# Shared by run.sh and scenarios.sh: building, Elasticsearch, the server, the
-# fictive nodes, sampling and the bookkeeping of results. Sourced, not run.
+# Shared by run.sh and the experiments: building, Elasticsearch, the server,
+# the fictive nodes, sampling and the bookkeeping of results. Sourced, not run.
 #
 # One machine plays the whole system. The server runs as a process on the
 # host and indexes into an Elasticsearch in a container; every node is a
@@ -11,13 +11,14 @@ EXP=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$EXP/.." && pwd)
 
 # The load on every node, and the node itself. All can be set from outside.
-: "${CONTAINERS:=5}"    # generators per node
-: "${RATE:=100}"        # lines per second of each generator
-: "${DURATION:=60}"     # seconds of load
-: "${NODE_CPUS:=1}"     # CPUs of a node
-: "${NODE_MEM:=512m}"   # memory of a node
-: "${SAMPLE_EVERY:=2}"  # seconds between two looks at the processes
+: "${CONTAINERS:=5}"      # generators per node
+: "${RATE:=100}"          # lines per second of each generator
+: "${DURATION:=60}"       # seconds of load
+: "${NODE_CPUS:=1}"       # CPUs of a node
+: "${NODE_MEM:=512m}"     # memory of a node
+: "${SAMPLE_EVERY:=2}"    # seconds between two looks at the processes
 : "${INDEX_TIMEOUT:=300}" # the longest wait for the lines to be searchable
+: "${REPLAY:=}"           # a log file whose lines the generators write, instead of filler
 
 : "${ES_PORT:=19200}" "${ES_VERSION:=9.5.5}"
 : "${GRPC_PORT:=50071}" "${HTTP_PORT:=18071}" "${NODE_PORT_BASE:=21000}"
@@ -28,6 +29,7 @@ NET=cosmicdust-exp
 ES_NAME=cosmicdust-exp-es
 NODE_IMAGE=cosmicdust-node:exp
 LOGGEN_IMAGE=cosmicdust-loggen:exp
+AGENT_IMAGE=cosmicdust-agent:exp
 
 log() { echo "$(date +%H:%M:%S) $*" >&2; }
 die() {
@@ -42,14 +44,16 @@ need() {
 	done
 	"$PYTHON" -c 'import matplotlib' 2>/dev/null || die "$PYTHON has no matplotlib (set PYTHON to one that has)"
 	docker info >/dev/null 2>&1 || die "cannot reach the Docker daemon"
+	[ -z "$REPLAY" ] || [ -r "$REPLAY" ] || die "cannot read REPLAY=$REPLAY"
 }
 
 # build makes everything a run needs: the server and the verifier for the
-# host, and the node's image with the agent and the generator inside.
+# host, the node's image with the agent and the generator inside, and the
+# agent as an image of its own, for the runs that put it in a container.
 build() {
 	BIN=$OUT/bin
 	local ctx=$OUT/build
-	mkdir -p "$BIN" "$ctx"
+	mkdir -p "$BIN" "$ctx" "$OUT/images/agent"
 	log "building"
 	(cd "$REPO" &&
 		go build -o "$BIN/cosmicdust-server" ./cmd/server &&
@@ -61,6 +65,9 @@ build() {
 	docker build -q -f "$EXP/cmd/loggen/Dockerfile" -t "$LOGGEN_IMAGE" "$ctx" >/dev/null || die "generator image"
 	docker save "$LOGGEN_IMAGE" -o "$ctx/loggen.tar"
 	docker build -q --build-arg "DIND=$DIND" -f "$EXP/node/Dockerfile" -t "$NODE_IMAGE" "$ctx" >/dev/null || die "node image"
+	printf 'FROM scratch\nCOPY cosmicdust-agent /cosmicdust-agent\nENTRYPOINT ["/cosmicdust-agent"]\n' |
+		docker build -q -f - -t "$AGENT_IMAGE" "$ctx" >/dev/null || die "agent image"
+	docker save "$AGENT_IMAGE" -o "$OUT/images/agent/agent.tar"
 }
 
 # es_up makes sure there is an Elasticsearch to index into. Given ES_ADDRESS
@@ -137,27 +144,61 @@ node_exec() { # <node> <command...>
 	docker exec "$(node_name "$i")" "$@"
 }
 
-# nodes_start runs k nodes and waits until each has its Docker daemon up and
-# its agent answering.
+# node_run starts node i; whatever follows goes to docker run before the
+# image: limits, mounts, settings.
+node_run() { # <node> <docker run arguments...>
+	local i=$1 replay=()
+	shift
+	if [ -n "$REPLAY" ]; then
+		replay=(-v "$REPLAY:/replay.log:ro")
+	fi
+	docker run -d --privileged --name "$(node_name "$i")" --hostname "node-$i" --network "$NET" \
+		-p "127.0.0.1:$((NODE_PORT_BASE + i)):9101" "${replay[@]}" \
+		-e COSMICDUST_NODE="node-$i" -e COSMICDUST_SYNC_URL="grpc://$GATEWAY:$GRPC_PORT" \
+		"$@" "$NODE_IMAGE" >/dev/null || die "cannot start node $i"
+}
+
+# node_wait waits until node i has its Docker daemon up and its images
+# loaded, and - unless told otherwise - its agent answering.
+node_wait() { # <node> [docker]
+	local i=$1 tries
+	for tries in $(seq 1 600); do
+		if node_exec "$i" test -e /run/node-ready 2>/dev/null; then
+			if [ "${2:-agent}" = docker ] ||
+				curl -fs --max-time 1 "http://127.0.0.1:$((NODE_PORT_BASE + i))/healthz" >/dev/null 2>&1; then
+				return 0
+			fi
+		fi
+		sleep 0.5
+	done
+	die "node $i did not come up: $(docker logs --tail 5 "$(node_name "$i")" 2>&1)"
+}
+
+# nodes_start runs k nodes with the agent in each, limited to NODE_CPUS and
+# NODE_MEM, and waits for all of them.
 nodes_start() { # <k>
-	local i tries
+	local i
 	for i in $(seq 1 "$1"); do
-		docker run -d --privileged --name "$(node_name "$i")" --hostname "node-$i" --network "$NET" \
-			--cpus "$NODE_CPUS" -m "$NODE_MEM" -p "127.0.0.1:$((NODE_PORT_BASE + i)):9101" \
-			-e COSMICDUST_NODE="node-$i" -e COSMICDUST_SYNC_URL="grpc://$GATEWAY:$GRPC_PORT" \
-			"$NODE_IMAGE" >/dev/null || die "cannot start node $i"
+		node_run "$i" --cpus "$NODE_CPUS" -m "$NODE_MEM"
 	done
 	for i in $(seq 1 "$1"); do
-		for tries in $(seq 1 300); do
-			curl -fs --max-time 1 "http://127.0.0.1:$((NODE_PORT_BASE + i))/healthz" >/dev/null 2>&1 && break
-			sleep 0.5
-		done
-		[ "$tries" -lt 300 ] || die "node $i did not come up: $(docker logs --tail 5 "$(node_name "$i")" 2>&1)"
+		node_wait "$i"
 	done
 }
 
 nodes_stop() {
 	docker ps -aq --filter "name=^cosmicdust-node-" | xargs -r docker rm -fv >/dev/null 2>&1 || true
+}
+
+# generator_args are loggen's arguments for count lines at rate lines per
+# second, of filler or - with REPLAY - of a real log's text.
+generator_args() { # <id> <rate> <count>
+	echo "-id $1 -rate $2 -count $3${REPLAY:+ -replay /data/replay.log}"
+}
+
+# generator_mounts gives a generator the log it replays.
+generator_mounts() {
+	echo "${REPLAY:+-v /replay.log:/data/replay.log:ro}"
 }
 
 # generators_start runs the generators of every node: each writes count
@@ -166,8 +207,9 @@ generators_start() { # <k> <count>
 	local i j pids=()
 	for i in $(seq 1 "$1"); do
 		for j in $(seq 1 "$CONTAINERS"); do
-			node_exec "$i" docker run -d --name "gen-$j" --label "app=app-$j" "$LOGGEN_IMAGE" \
-				-id "node-$i/c$j" -rate "$RATE" -count "$2" >/dev/null &
+			# shellcheck disable=SC2046
+			node_exec "$i" docker run -d --name "gen-$j" --label "app=app-$j" $(generator_mounts) "$LOGGEN_IMAGE" \
+				$(generator_args "node-$i/c$j" "$RATE" "$2") >/dev/null &
 			pids+=($!)
 		done
 	done
@@ -235,6 +277,14 @@ usage() { # <samples> <from> <to>
 		}' "$1"
 }
 
+# machine is the whole machine's CPU time so far, busy and in all, in ticks.
+# Two of them say how many cores were busy in between: with everything on one
+# machine, a run during which something else was busy is not worth keeping.
+machine() { awk '/^cpu / { idle = $5 + $6; all = 0; for (i = 2; i <= 9; i++) all += $i; print all - idle, all }' /proc/stat; }
+busy_cores() { # <machine before> <machine after>
+	echo "$1 $2" | awk -v n="$(nproc)" '{ d = $4 - $2; printf "%.2f\n", (d > 0 ? n * ($3 - $1) / d : 0) }'
+}
+
 # wait_indexed waits until a run's lines are all searchable and prints how
 # long that took; it fails once INDEX_TIMEOUT has passed.
 wait_indexed() { # <index prefix> <lines expected>
@@ -257,9 +307,57 @@ wait_indexed() { # <index prefix> <lines expected>
 
 since() { awk -v a="$1" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f\n", b - a }'; }
 
+# A run belongs to an experiment and is one point of it: a place on the
+# experiment's axis (X: a number of nodes, a load) and a series (SERIES: a
+# scenario, a collector). begin sets up its directory and its names.
+begin() { # <experiment> <x> <series> <round>
+	EXPERIMENT=$1 X=$2 SERIES=$3 ROUND=$4
+	RUN=$OUT/runs/$1-$2-$3-r$4
+	PREFIX=$(echo "exp-$1-$2-$3-r$4" | tr 'A-Z_' 'a-z-')
+	rm -rf "$RUN"
+	mkdir -p "$RUN"
+	teardown
+	es_drop "$PREFIX"
+}
+
 # emit adds one measured value of the run in progress.
 emit() { # <metric> <value>
-	echo "$SCENARIO,$K,$ROUND,$1,$2" >>"$RUN/rows.csv"
+	echo "$EXPERIMENT,$X,$SERIES,$ROUND,$1,$2" >>"$RUN/rows.csv"
+}
+
+# verified reads every generator's lines back through the query API and
+# emits what came of it; it fails unless every line is there exactly once.
+verified() { # <generators per node> <lines per generator> <node>...
+	local generators=$1 count=$2 stored missing duplicate
+	shift 2
+	"$BIN/verify" -server "127.0.0.1:$GRPC_PORT" -generators "$generators" -count "$count" "$@" \
+		>"$RUN/verify.txt" 2>"$RUN/verify.err" || true
+	awk -v k="$#" -v expected="$(($# * generators * count))" '
+		{ n++; for (i = 1; i <= NF; i++) { split($i, kv, "="); sum[kv[1]] += kv[2] } }
+		END {
+			if (n != k) { sum["lines"] = 0; sum["missing"] = expected }
+			print sum["lines"] + 0, sum["missing"] + 0, sum["duplicate"] + 0
+		}' "$RUN/verify.txt" >"$RUN/lines.txt"
+	read -r stored missing duplicate <"$RUN/lines.txt"
+	emit lines_expected "$(($# * generators * count))"
+	emit lines_stored "$stored"
+	emit lines_missing "$missing"
+	emit lines_duplicate "$duplicate"
+	if [ "$missing" -eq 0 ] && [ "$duplicate" -eq 0 ]; then
+		emit exactly_once 1
+		return 0
+	fi
+	emit exactly_once 0
+	log "$stored lines stored, $missing missing, $duplicate twice; see $RUN"
+	return 1
+}
+
+# finish stops everything and hands the run's values to the session.
+finish() {
+	teardown
+	es_drop "$PREFIX"
+	cat "$RUN/rows.csv" >>"$OUT/runs.csv"
+	touch "$OUT/done/$EXPERIMENT-$X-$SERIES-r$ROUND"
 }
 
 teardown() {

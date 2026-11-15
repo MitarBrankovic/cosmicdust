@@ -1,16 +1,32 @@
-# The scenarios, and the run they share. Sourced by run.sh after lib.sh.
+# The experiment "nodes": the whole system with several nodes. Sourced by
+# run.sh after lib.sh.
 #
 # A run starts the server and k nodes, lets every node's generators write
 # CONTAINERS x RATE lines a second for DURATION seconds, waits until every
 # line is searchable, reads all of them back through the query API, and
-# records what the agents and the server cost meanwhile. A scenario is what
-# happens while the generators write:
+# records what the agents and the server cost meanwhile. The axis is the
+# number of nodes; a series is a scenario, which is what happens while the
+# generators write:
 #
 #   steady   nothing: the cost of the system under a steady load
 #   outage   the server is away for most of the load, and containers fail
 #            meanwhile; it returns once the load is over
 #   churn    every few seconds the agent of one node is killed (kill -9) and
 #            started again, node after node
+
+: "${SCENARIOS:=steady,outage,churn}"
+: "${NODES:=1,3,5,10}"
+
+# nodes_units lists the runs of a round: "<nodes> <scenario>".
+nodes_units() {
+	local s k
+	for s in ${SCENARIOS//,/ }; do
+		declare -F "during_$s" >/dev/null || die "there is no scenario '$s'"
+		for k in ${NODES//,/ }; do
+			echo "$k $s"
+		done
+	done
+}
 
 # during_<scenario> runs while the generators write and returns when the
 # scenario's part is over. It may add to EXTRA the lines written by anything
@@ -67,29 +83,22 @@ during_churn() {
 	emit agent_kills "$kills"
 }
 
-# run_one is one run of a scenario with k nodes. Its values go to the run's
-# rows.csv and, once the run is complete, to the session's runs.csv.
-run_one() { # <scenario> <k> <round>
-	SCENARIO=$1 K=$2 ROUND=$3
-	RUN=$OUT/runs/$SCENARIO-k$K-r$ROUND
-	PREFIX=exp-$SCENARIO-k$K-r$ROUND
-	EXTRA=0
-	local count=$((RATE * DURATION)) nodes="" i from to settle failed=0
+# nodes_run is one run of a scenario with k nodes.
+nodes_run() { # <k> <scenario> <round>
+	K=$1
+	local scenario=$2 count=$((RATE * DURATION)) nodes=() i from to before after settle failed=0
 	local expected=$((K * CONTAINERS * count))
-
-	rm -rf "$RUN"
-	mkdir -p "$RUN"
-	teardown
-	es_drop "$PREFIX"
-	log "$SCENARIO, $K node(s), round $ROUND: $((K * CONTAINERS * RATE)) lines/s for $DURATION s"
+	EXTRA=0
+	begin nodes "$K" "$scenario" "$3"
+	log "nodes: $scenario, $K node(s), round $3: $((K * CONTAINERS * RATE)) lines/s for $DURATION s"
 
 	server_start "$RUN" "$PREFIX"
 	nodes_start "$K"
 	sample_start "$K" "$RUN/samples.csv"
-	from=$(date +%s.%N)
+	from=$(date +%s.%N) before=$(machine)
 	generators_start "$K" "$count"
-	"during_$SCENARIO"
-	to=$(date +%s.%N)
+	"during_$scenario"
+	to=$(date +%s.%N) after=$(machine)
 
 	# From the end of the scenario's part until every line can be searched.
 	if settle=$(wait_indexed "$PREFIX" $((expected + EXTRA))); then
@@ -97,36 +106,16 @@ run_one() { # <scenario> <k> <round>
 	else
 		failed=1
 	fi
-	if declare -F "after_$SCENARIO" >/dev/null; then
-		"after_$SCENARIO"
+	if declare -F "after_$scenario" >/dev/null; then
+		"after_$scenario"
 	fi
 	sample_stop
 
-	# Every line of every generator, read back through the query API.
-	for i in $(seq 1 "$K"); do
-		nodes="$nodes node-$i"
-	done
-	# shellcheck disable=SC2086
-	"$BIN/verify" -server "127.0.0.1:$GRPC_PORT" -generators "$CONTAINERS" -count "$count" $nodes \
-		>"$RUN/verify.txt" 2>"$RUN/verify.err" || true
-	awk -v k="$K" -v expected="$expected" '
-		{ n++; for (i = 1; i <= NF; i++) { split($i, kv, "="); sum[kv[1]] += kv[2] } }
-		END {
-			if (n != k) { sum["lines"] = 0; sum["missing"] = expected }
-			print sum["lines"] + 0, sum["missing"] + 0, sum["duplicate"] + 0
-		}' "$RUN/verify.txt" >"$RUN/lines.txt"
-	read -r stored missing duplicate <"$RUN/lines.txt"
 	emit lines_per_s $((K * CONTAINERS * RATE))
-	emit lines_expected "$expected"
-	emit lines_stored "$stored"
-	emit lines_missing "$missing"
-	emit lines_duplicate "$duplicate"
-	if [ "$missing" -eq 0 ] && [ "$duplicate" -eq 0 ]; then
-		emit exactly_once 1
-	else
-		emit exactly_once 0
-		failed=1
-	fi
+	for i in $(seq 1 "$K"); do
+		nodes+=("node-$i")
+	done
+	verified "$CONTAINERS" "$count" "${nodes[@]}" || failed=1
 
 	# What the agents and the server cost while the generators wrote: the
 	# agents as the mean and the worst of the nodes.
@@ -145,16 +134,13 @@ run_one() { # <scenario> <k> <round>
 	fi
 	emit files_received "$(server_metric cosmicdust_server_files_received_total)"
 	emit mb_received "$(server_metric cosmicdust_server_bytes_received_total | awk '{ printf "%.2f", $1 / 1e6 }')"
+	emit machine_busy_cores "$(busy_cores "$before" "$after")"
 	emit failed "$failed"
 
 	if [ "$failed" -ne 0 ]; then
-		log "run failed: $stored of $expected lines, $missing missing, $duplicate twice; see $RUN"
 		for i in $(seq 1 "$K"); do
 			node_exec "$i" cat /var/log/agent.log >"$RUN/agent-$i.log" 2>/dev/null || true
 		done
 	fi
-	teardown
-	es_drop "$PREFIX"
-	cat "$RUN/rows.csv" >>"$OUT/runs.csv"
-	touch "$OUT/done/$SCENARIO-k$K-r$ROUND"
+	finish
 }
