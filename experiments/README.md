@@ -18,6 +18,7 @@ the server over gRPC, through the gateway of a Docker network.
 | Experiment | What runs | Axis | Series |
 |---|---|---|---|
 | `nodes` | the whole system: the server and 1 to 10 nodes, each limited to `NODE_CPUS` and `NODE_MEM` | number of nodes | scenario |
+| `adverse` | the same system where things are hard for a node: a narrow link, a burst, a full store | number of nodes | scenario |
 | `compare` | one roomy node with a log collector in it as a container, under limits of its own | case | collector: the agent, Fluent Bit, Vector |
 | `ceiling` | the same with the agent alone, under growing loads | lines per second | the agent |
 
@@ -31,6 +32,21 @@ what happens meanwhile:
 | `steady` | nothing: the cost of the system under a steady load |
 | `outage` | the server is away from a quarter of the load until five seconds after its end; meanwhile containers fail on every node |
 | `churn` | every `KILL_EVERY` seconds the agent of one node is killed with `kill -9` and started again, node after node |
+
+### adverse
+
+The same runs, with scenarios of what a node at the edge has to live with:
+
+| Scenario | While the generators write |
+|---|---|
+| `narrow` | `outage`, with every node behind a link of `LINK_MBIT` Mbit/s with a round trip of `LINK_RTT` ms that loses `LINK_LOSS` % of the packets each way: what waited for the server crosses that link |
+| `burst` | for the middle third of the load, `BURST_X` times as many lines |
+| `evict` | the server is away for the whole load and the agent's store may hold `STORE_QUOTA`: the agent drops its oldest logs for room and records every drop |
+| `block` | the same, with the agent told to stop reading instead of dropping |
+
+The link is shaped inside the node, with netem, and only for what goes to the server and comes from it. In `evict`
+a run is right when every line is either there once or among the lines the agents say they dropped; in `block`,
+when every line is there once.
 
 ### compare and ceiling
 
@@ -60,13 +76,17 @@ pipelines.
 
 | Value | Experiments | |
 |---|---|---|
-| `exactly_once` | all, for the agent | 1 if every line of every generator came back through the query API once: none missing, none twice ([`cmd/verify`](cmd/verify/main.go)) |
+| `exactly_once` | all, for the agent | 1 if every line of every generator came back through the query API once: none missing, none twice ([`cmd/verify`](cmd/verify/main.go)); in `evict`, none missing but the ones recorded as dropped |
 | `lines_expected`, `lines_stored`, `lines_missing`, `lines_duplicate` | all | the lines behind that; for Fluent Bit and Vector, `lines_stored` is the lines in their output file |
-| `agent_cpu_pct`, `agent_cpu_pct_max` | `nodes` | CPU of the agent while the generators wrote, in percent of one core: the mean of the nodes and the busiest node |
-| `agent_rss_mb`, `agent_rss_mb_max` | `nodes` | resident memory of the agent, the most seen: the mean of the nodes and the largest |
-| `server_cpu_pct`, `server_rss_mb` | `nodes` | the same for the server |
-| `settle_s` | all, for the agent | seconds until every line can be searched, from the end of the load (or, in `outage`, from the server's return) |
-| `urgent_expected`, `urgent_delivered` | `nodes`, `outage` | containers that failed while the server was away, and how many of them it was told about at once after its return |
+| `agent_cpu_pct`, `agent_cpu_pct_max` | `nodes`, `adverse` | CPU of the agent while the generators wrote, in percent of one core: the mean of the nodes and the busiest node |
+| `agent_rss_mb`, `agent_rss_mb_max` | `nodes`, `adverse` | resident memory of the agent, the most seen: the mean of the nodes and the largest |
+| `server_cpu_pct`, `server_rss_mb` | `nodes`, `adverse` | the same for the server |
+| `settle_s` | all, for the agent | seconds until every line can be searched, from the end of the load (or, where the server was away, from its return) |
+| `scenario_s` | `nodes`, `adverse` | seconds from the first line to the end of the scenario's part: more than planned if a node could not write as fast as asked |
+| `urgent_expected`, `urgent_delivered` | `outage`, `narrow` | containers that failed while the server was away, and how many of them it was told about at once after its return |
+| `link_mb`, `link_lost_pct` | `narrow` | what the narrow links carried to the server, and the share of the packets they lost on the way |
+| `lines_dropped`, `dropped_pct` | `evict`, `block` | lines the agents dropped for room, as they count them, and their share of the lines written |
+| `store_full_times` | `evict`, `block` | how many times an agent stopped reading because its store was full |
 | `collector_cpu_pct` | `compare`, `ceiling` | CPU of the collector while the generators wrote (with quiet containers: for the length of the case), in percent of one core |
 | `collector_anon_mb`, `collector_peak_mb` | `compare`, `ceiling` | its anonymous memory at the end of the load; its memory at its largest, the page cache it was charged with included |
 | `runtime_cpu_pct`, `generators_cpu_pct` | `compare`, `ceiling` | CPU of the node's runtime meanwhile (dockerd, containerd and their shims), and of the generators |
@@ -100,9 +120,13 @@ makes the summary and the charts again.
 
 | Variable | Default | |
 |---|---|---|
-| `CONTAINERS`, `RATE`, `DURATION` | `5`, `100`, `60` | `nodes`: generators on every node, lines per second of each, seconds of load |
-| `NODE_CPUS`, `NODE_MEM` | `1`, `512m` | `nodes`: what a node may use |
+| `CONTAINERS`, `RATE`, `DURATION` | `5`, `100`, `60` | `nodes`, `adverse`: generators on every node, lines per second of each, seconds of load |
+| `NODE_CPUS`, `NODE_MEM` | `1`, `512m` | `nodes`, `adverse`: what a node may use |
 | `KILL_EVERY`, `CRASHES` | `10`, `5` | `churn`: seconds between two kills; `outage`: containers that fail on every node |
+| `ADVERSE` | `narrow,burst,evict,block` | `adverse`: the scenarios |
+| `LINK_MBIT`, `LINK_RTT`, `LINK_LOSS` | `1`, `100`, `5` | `narrow`: the link's megabits per second, round trip in milliseconds, and percent of the packets lost |
+| `BURST_X` | `5` | `burst`: how many times the load |
+| `STORE_QUOTA` | `256KiB` | `evict`, `block`: the most an agent's store may hold; less than what a node's load takes |
 | `CASES` | all seven | `compare`: the cases, space separated; a case can also be written `<containers>x<lines per second>` |
 | `SUBJECTS` | `agent fluent-bit vector` | `compare`: the collectors |
 | `FLUENT_BIT_IMAGE`, `VECTOR_IMAGE` | `fluent/fluent-bit:5.1.2`, `timberio/vector:0.58.0-debian` | their images |
@@ -114,6 +138,6 @@ makes the summary and the charts again.
 ## What it needs
 
 Docker that can run privileged containers (the nodes are Docker in Docker), Go, curl, and Python 3 with matplotlib;
-`zstdcat` to count Vector's output. About 2 GB of memory for Elasticsearch, `NODE_MEM` for every node of `nodes` and
-4 GB for the node of `compare` and `ceiling`. For numbers worth keeping, a machine that does nothing else: the nodes,
+`zstdcat` to count Vector's output; for `narrow`, a kernel with netem and ifb. About 2 GB of memory for
+Elasticsearch, `NODE_MEM` for every node of `nodes` and `adverse`, and 4 GB for the node of `compare` and `ceiling`. For numbers worth keeping, a machine that does nothing else: the nodes,
 the server and Elasticsearch share its cores.

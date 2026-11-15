@@ -20,6 +20,13 @@ REPO=$(cd "$EXP/.." && pwd)
 : "${INDEX_TIMEOUT:=300}" # the longest wait for the lines to be searchable
 : "${REPLAY:=}"           # a log file whose lines the generators write, instead of filler
 
+# The conditions of the runs that make things hard for a node.
+: "${LINK_MBIT:=1}"        # a narrow link: megabits per second, each way
+: "${LINK_RTT:=100}"       # its round trip, in milliseconds
+: "${LINK_LOSS:=5}"        # the packets it loses, in percent, each way
+: "${BURST_X:=5}"          # a burst: how many times the load
+: "${STORE_QUOTA:=256KiB}" # a full store: the most the agent's store may hold
+
 : "${ES_PORT:=19200}" "${ES_VERSION:=9.5.5}"
 : "${GRPC_PORT:=50071}" "${HTTP_PORT:=18071}" "${NODE_PORT_BASE:=21000}"
 : "${DIND:=docker:29-dind}"
@@ -175,15 +182,55 @@ node_wait() { # <node> [docker]
 }
 
 # nodes_start runs k nodes with the agent in each, limited to NODE_CPUS and
-# NODE_MEM, and waits for all of them.
+# NODE_MEM, and waits for all of them. NODE_ARGS are more arguments of docker
+# run for every node: the agent's settings, as COSMICDUST_<FLAG>.
+NODE_ARGS=()
 nodes_start() { # <k>
 	local i
 	for i in $(seq 1 "$1"); do
-		node_run "$i" --cpus "$NODE_CPUS" -m "$NODE_MEM"
+		node_run "$i" --cpus "$NODE_CPUS" -m "$NODE_MEM" "${NODE_ARGS[@]}"
 	done
 	for i in $(seq 1 "$1"); do
 		node_wait "$i"
 	done
+}
+
+# link_shape makes the way between node i and the server a narrow one:
+# LINK_MBIT megabits per second, a round trip of LINK_RTT ms, and LINK_LOSS
+# percent of the packets lost, each way. Only what goes to the server's port
+# and comes from it is shaped, so the node's metrics are read as before. What
+# comes in is shaped on an ifb device: a queue holds back only what leaves.
+link_shape() { # <node>
+	local half=$((LINK_RTT / 2)) limit netem
+	# netem's limit counts the packets in its delay line too: about a second's worth.
+	limit=$((LINK_MBIT * 1000000 / 8 * (1000 + half) / 1000 / 1514 + 1))
+	netem="netem delay ${half}ms loss ${LINK_LOSS}% rate ${LINK_MBIT}mbit limit $limit"
+	node_exec "$1" sh -e -c "
+		# Whole packets, not the batches the kernel would hand over: a loss is one packet.
+		ethtool -K eth0 tso off gso off gro off >/dev/null
+		ip link add ifb0 type ifb
+		ip link set ifb0 up
+		tc qdisc add dev eth0 root handle 1: prio bands 3 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+		tc qdisc add dev eth0 parent 1:3 handle 30: $netem
+		tc filter add dev eth0 parent 1: protocol ip u32 \
+			match ip protocol 6 0xff match ip dport $GRPC_PORT 0xffff flowid 1:3
+		tc qdisc add dev ifb0 root handle 30: $netem
+		tc qdisc add dev eth0 handle ffff: ingress
+		tc filter add dev eth0 parent ffff: protocol ip u32 \
+			match ip protocol 6 0xff match ip sport $GRPC_PORT 0xffff action mirred egress redirect dev ifb0
+	" || die "cannot shape the link of node $1"
+}
+
+# link_stats prints what the links of k nodes carried to the server and what
+# they lost on the way: "<megabytes> <percent of the packets>".
+link_stats() { # <k>
+	local i
+	for i in $(seq 1 "$1"); do
+		node_exec "$i" tc -s qdisc show dev eth0
+	done | awk '
+		/^qdisc/ { netem = ($2 == "netem") }
+		netem && $1 == "Sent" { bytes += $2; sent += $4; lost += $7 }
+		END { printf "%.2f %.2f\n", bytes / 1e6, (sent + lost > 0 ? 100 * lost / (sent + lost) : 0) }'
 }
 
 nodes_stop() {
@@ -201,19 +248,30 @@ generator_mounts() {
 	echo "${REPLAY:+-v /replay.log:/data/replay.log:ro}"
 }
 
-# generators_start runs the generators of every node: each writes count
-# numbered lines at RATE lines per second and ends.
-generators_start() { # <k> <count>
-	local i j pids=()
+# generators_start runs CONTAINERS generators on every node: each writes
+# count numbered lines at RATE lines per second (or the rate given) and ends.
+# A generator's id is "node-<i>/<letter><j>", with the letter c unless given.
+generators_start() { # <k> <count> [letter] [rate]
+	local i j letter=${3:-c} rate=${4:-$RATE} pids=()
 	for i in $(seq 1 "$1"); do
 		for j in $(seq 1 "$CONTAINERS"); do
 			# shellcheck disable=SC2046
-			node_exec "$i" docker run -d --name "gen-$j" --label "app=app-$j" $(generator_mounts) "$LOGGEN_IMAGE" \
-				$(generator_args "node-$i/c$j" "$RATE" "$2") >/dev/null &
+			node_exec "$i" docker run -d --name "gen-$letter$j" --label "app=app-$j" $(generator_mounts) "$LOGGEN_IMAGE" \
+				$(generator_args "node-$i/$letter$j" "$rate" "$2") >/dev/null &
 			pids+=($!)
 		done
 	done
 	# Only these: the sampler runs in the background too, and never ends.
+	wait "${pids[@]}"
+}
+
+# generators_wait returns once no generator of k nodes is still writing.
+generators_wait() { # <k>
+	local i pids=()
+	for i in $(seq 1 "$1"); do
+		node_exec "$i" sh -c 'docker wait $(docker ps -q --filter name=gen-) >/dev/null 2>&1 || true' &
+		pids+=($!)
+	done
 	wait "${pids[@]}"
 }
 
@@ -225,6 +283,14 @@ crash() { # <node> <name>
 
 scrape() { curl -s --max-time 2 "$1/metrics" 2>/dev/null; }
 server_metric() { scrape "http://127.0.0.1:$HTTP_PORT" | awk -v k="$1" '$1 == k { print $2; exit }'; }
+
+# agents_sum adds up one value of the agents' metrics over k nodes.
+agents_sum() { # <k> <metric>
+	local i
+	for i in $(seq 1 "$1"); do
+		scrape "http://127.0.0.1:$((NODE_PORT_BASE + i))"
+	done | awk -v k="$2" '$1 == k { s += $2 } END { printf "%d\n", s }'
+}
 
 # sampler writes, every SAMPLE_EVERY seconds, the CPU time and the resident
 # memory of every agent and of the server, as they report them themselves:
@@ -286,12 +352,17 @@ busy_cores() { # <machine before> <machine after>
 }
 
 # wait_indexed waits until a run's lines are all searchable and prints how
-# long that took; it fails once INDEX_TIMEOUT has passed.
+# long that took; it fails once INDEX_TIMEOUT has passed. Where the agents may
+# drop lines for room (MAY_DROP is the number of nodes), a line an agent says
+# it dropped is accounted for as well.
 wait_indexed() { # <index prefix> <lines expected>
 	local start now have
 	start=$(date +%s.%N)
 	while :; do
 		have=$(es_lines "$1")
+		if [ -n "${MAY_DROP:-}" ]; then
+			have=$((${have:-0} + $(agents_sum "$MAY_DROP" cosmicdust_agent_store_dropped_rows_total)))
+		fi
 		now=$(date +%s.%N)
 		if [ "${have:-0}" -ge "$2" ]; then
 			awk -v a="$start" -v b="$now" 'BEGIN { printf "%.1f\n", b - a }'
@@ -327,28 +398,35 @@ emit() { # <metric> <value>
 
 # verified reads every generator's lines back through the query API and
 # emits what came of it; it fails unless every line is there exactly once.
+# A run may have set:
+#   ALSO, ALSO_LINES  more generators on every node, as verify's -also, and
+#                     the lines they wrote per node
+#   MAY_MISS          lines that are rightly not there: the agents recorded
+#                     dropping exactly that many
 verified() { # <generators per node> <lines per generator> <node>...
-	local generators=$1 count=$2 stored missing duplicate
+	local generators=$1 count=$2 stored missing duplicate expected
 	shift 2
-	"$BIN/verify" -server "127.0.0.1:$GRPC_PORT" -generators "$generators" -count "$count" "$@" \
+	expected=$(($# * (generators * count + ${ALSO_LINES:-0})))
+	# shellcheck disable=SC2086
+	"$BIN/verify" -server "127.0.0.1:$GRPC_PORT" -generators "$generators" -count "$count" ${ALSO:-} "$@" \
 		>"$RUN/verify.txt" 2>"$RUN/verify.err" || true
-	awk -v k="$#" -v expected="$(($# * generators * count))" '
+	awk -v k="$#" -v expected="$expected" '
 		{ n++; for (i = 1; i <= NF; i++) { split($i, kv, "="); sum[kv[1]] += kv[2] } }
 		END {
 			if (n != k) { sum["lines"] = 0; sum["missing"] = expected }
 			print sum["lines"] + 0, sum["missing"] + 0, sum["duplicate"] + 0
 		}' "$RUN/verify.txt" >"$RUN/lines.txt"
 	read -r stored missing duplicate <"$RUN/lines.txt"
-	emit lines_expected "$(($# * generators * count))"
+	emit lines_expected "$expected"
 	emit lines_stored "$stored"
 	emit lines_missing "$missing"
 	emit lines_duplicate "$duplicate"
-	if [ "$missing" -eq 0 ] && [ "$duplicate" -eq 0 ]; then
+	if [ "$missing" -eq "${MAY_MISS:-0}" ] && [ "$duplicate" -eq 0 ]; then
 		emit exactly_once 1
 		return 0
 	fi
 	emit exactly_once 0
-	log "$stored lines stored, $missing missing, $duplicate twice; see $RUN"
+	log "$stored lines stored, $missing missing (${MAY_MISS:-0} recorded as dropped), $duplicate twice; see $RUN"
 	return 1
 }
 

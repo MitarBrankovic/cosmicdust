@@ -9,6 +9,9 @@
 ARG DIND=docker:29-dind
 FROM ${DIND}
 
+# tc and ethtool, for the runs that make the node's link a narrow one.
+RUN apk add --no-cache iproute2 ethtool
+
 # No TLS for the inner daemon: nothing outside the container talks to it.
 ENV DOCKER_TLS_CERTDIR=
 

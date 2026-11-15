@@ -9,9 +9,9 @@
 #   experiments/run.sh -n 5 -o <directory>     continue a session that was interrupted
 #
 #   -n <rounds>       how many times every run is made (default 3)
-#   -e <experiments>  nodes, compare, ceiling; comma separated (default all)
+#   -e <experiments>  nodes, adverse, compare, ceiling; comma separated (default all)
 #   -s <scenarios>    nodes: steady, outage, churn (default all)
-#   -k <nodes>        nodes: numbers of nodes (default 1,3,5,10)
+#   -k <nodes>        nodes and adverse: numbers of nodes (default 1,3,5,10)
 #   -o <directory>    where the results go (default experiments/results/<time>);
 #                     runs already there are not repeated
 #   -q                quick: short runs, small loads, two cases
@@ -20,6 +20,9 @@
 #
 #   nodes    the whole system with 1 to 10 nodes: steady load, the server
 #            away, agents killed (nodes.sh)
+#   adverse  the same system where things are hard for a node: a narrow link
+#            that loses packets, a burst of lines, a full store (nodes.sh;
+#            ADVERSE, LINK_MBIT, LINK_RTT, LINK_LOSS, BURST_X, STORE_QUOTA)
 #   compare  the agent against Fluent Bit and Vector on one node, each under
 #            the same limits (collectors.sh; CASES, SUBJECTS)
 #   ceiling  the agent under growing loads (collectors.sh; LOADS)
@@ -38,13 +41,13 @@
 #   runs/         what each run left: samples, the verifier's answer, logs
 set -u
 
-quick_cases=${CASES-} quick_loads=${LOADS-}
+quick_cases=${CASES-} quick_loads=${LOADS-} quick_quota=${STORE_QUOTA-}
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 . "$EXP/nodes.sh"
 . "$EXP/collectors.sh"
 
 ROUNDS=3
-EXPERIMENTS=nodes,compare,ceiling
+EXPERIMENTS=nodes,adverse,compare,ceiling
 OUT=
 while getopts "n:e:s:k:o:qh" opt; do
 	case $opt in
@@ -57,6 +60,8 @@ while getopts "n:e:s:k:o:qh" opt; do
 		QUICK=1 CONTAINERS=2 RATE=50 DURATION=20
 		[ -n "$quick_cases" ] || CASES="idle0 load1k"
 		[ -n "$quick_loads" ] || LOADS="10x100"
+		# Small enough for so few lines to fill it.
+		[ -n "$quick_quota" ] || STORE_QUOTA=32KiB
 		;;
 	*)
 		sed -n '2,/^set -u/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
@@ -96,6 +101,7 @@ trap 'exit 130' INT TERM
 	echo "commit: $(git -C "$REPO" describe --always --dirty 2>/dev/null)"
 	echo "rounds: $ROUNDS; experiments: $EXPERIMENTS"
 	echo "nodes: scenarios $SCENARIOS; sizes $NODES; per node $CONTAINERS generators x $RATE lines/s for $DURATION s; $NODE_CPUS CPU, $NODE_MEM"
+	echo "adverse: scenarios $ADVERSE; link $LINK_MBIT Mbit/s, round trip $LINK_RTT ms, loss $LINK_LOSS %; burst x$BURST_X; store quota $STORE_QUOTA"
 	echo "compare: cases $CASES; collectors $SUBJECTS ($FLUENT_BIT_IMAGE, $VECTOR_IMAGE)"
 	echo "ceiling: loads $LOADS"
 	echo "generators write: ${REPLAY:-filler}"
