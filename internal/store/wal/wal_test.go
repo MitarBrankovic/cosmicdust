@@ -489,6 +489,47 @@ func TestNoSpaceIsUndoneAndRetried(t *testing.T) {
 	}
 }
 
+// A held WAL takes no block, but what it already holds must still reach the
+// store: a segment left open could never be converted, and a store that has
+// no room because of that segment would wait for room for good.
+func TestHeldWALStillSealsByAge(t *testing.T) {
+	w := open(t, t.TempDir(), func(o *Options) { o.SegmentAge = time.Minute })
+	if err := w.Add(recs("a", 1, 5)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	w.Hold(true)
+	if err := w.Add(recs("a", 6, 5)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); !isTemporary(err) {
+		t.Fatalf("Flush returned %v on a held WAL, want a temporary error", err)
+	}
+	w.tick()
+	if len(w.Sealed()) != 0 {
+		t.Fatal("sealed before its age")
+	}
+	w.opened = w.opened.Add(-time.Minute)
+	w.tick()
+	if len(w.Sealed()) != 1 {
+		t.Fatalf("%d sealed while held, want 1", len(w.Sealed()))
+	}
+	if got := lines(t, w); len(got) != 5 || got[4] != "a-5" {
+		t.Fatalf("lines %v: the five written before the hold", got)
+	}
+	if p, _ := w.Position("a"); p.Offset != 600 {
+		t.Fatalf("position moved to %d by a block not written", p.Offset)
+	}
+	w.Hold(false)
+	w.tick() // room again: the waiting block goes out, into the next segment
+	seal(t, w)
+	if got := lines(t, w); len(got) != 10 || got[9] != "a-10" {
+		t.Fatalf("lines %v: each line once, in order", got)
+	}
+}
+
 func TestBigPendingBlockIsWrittenAtOnce(t *testing.T) {
 	w := open(t, t.TempDir(), func(o *Options) { o.BlockBytes = 500 })
 	if err := w.Add(recs("a", 1, 100)); err != nil {
