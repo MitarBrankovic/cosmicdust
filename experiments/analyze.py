@@ -70,8 +70,12 @@ EXPERIMENTS = {
         "axis": "lines per second",
         "charts": {
             "collector_cpu_pct": "CPU of the agent (% of one core)",
+            "throttled_s": "time the agent was held back by its CPU limit (s)",
+            "delivered_s": "until every line is at the server (s)",
+            "unread_pct": "lines the agent has not read when the last one is written (%)",
             "behind_pct": "lines not yet searchable when the last one is written (%)",
             "settle_s": "until every line is searchable (s)",
+            "written_per_s": "lines per second the generators managed",
             "runtime_cpu_pct": "CPU of the node's runtime: dockerd, containerd, shims (% of one core)",
         },
     },

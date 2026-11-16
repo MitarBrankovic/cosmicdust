@@ -64,8 +64,11 @@ limit.
 | `edge25` | 10 x 100 | 120 | 0.25 CPU, 128 MB |
 | `edge10` | 10 x 100 | 120 | 0.10 CPU, 256 MB |
 
-`ceiling` runs the loads in `LOADS` (containers x lines per second, by default `20x500 40x500 40x1000 60x1000`), each
-for 120 s under 1 CPU and 512 MB.
+`ceiling` runs the loads in `LOADS` (containers x lines per second, by default `10x500 20x500 40x500 60x500`), each
+for `LOAD_SECONDS` (60), with the agent under `CEILING_CPUS` (a quarter of a core) and 512 MB: a node of this kind
+cannot write as many lines as the agent takes with a whole core. Near its ceiling the agent is held back by its
+limit more and more (`throttled_s`) and needs longer after the load to hand everything to the server
+(`delivered_s`); how soon the lines can be searched after that is the server's indexing, not the agent.
 
 The three collectors do not do the same work. The agent stores what it reads in Parquet and sends it to the server,
 and its run ends when every line can be searched there. Fluent Bit tails and writes a plain file; Vector tails,
@@ -92,7 +95,9 @@ pipelines.
 | `runtime_cpu_pct`, `generators_cpu_pct` | `compare`, `ceiling` | CPU of the node's runtime meanwhile (dockerd, containerd and their shims), and of the generators |
 | `cpu_s_per_gb`, `input_mb` | `compare`, `ceiling` | CPU seconds of the collector per GB of log files, over the whole run; the size of the log files |
 | `complete_pct` | `compare`, `ceiling` | `lines_stored` as a percentage of the lines written |
-| `behind_pct` | `compare`, `ceiling`, for the agent | the lines not yet searchable at the moment the last one is written |
+| `unread_pct`, `behind_pct` | `compare`, `ceiling`, for the agent | at the moment the last line is written: the lines the agent has not read yet, and the lines not yet searchable |
+| `delivered_s` | `compare`, `ceiling`, for the agent | seconds from the end of the load until the agent has stored every line and the server has as many rows in its archive |
+| `written_per_s` | `compare`, `ceiling` | lines per second the generators managed to write: less than asked for when the node itself is too busy |
 | `throttled_s` | `compare`, `ceiling` | seconds the collector was held back by its CPU limit |
 | `machine_busy_cores` | all | cores of the whole machine that were busy during the run: a run made while something else was busy is not worth keeping |
 
@@ -126,11 +131,11 @@ makes the summary and the charts again.
 | `ADVERSE` | `narrow,burst,evict,block` | `adverse`: the scenarios |
 | `LINK_MBIT`, `LINK_RTT`, `LINK_LOSS` | `1`, `100`, `5` | `narrow`: the link's megabits per second, round trip in milliseconds, and percent of the packets lost |
 | `BURST_X` | `5` | `burst`: how many times the load |
-| `STORE_QUOTA` | `256KiB` | `evict`, `block`: the most an agent's store may hold; less than what a node's load takes |
+| `STORE_QUOTA` | `512KiB`, with `REPLAY` `1MiB` | `evict`, `block`: the most an agent's store may hold; less than what a node's load takes |
 | `CASES` | all seven | `compare`: the cases, space separated; a case can also be written `<containers>x<lines per second>` |
 | `SUBJECTS` | `agent fluent-bit vector` | `compare`: the collectors |
 | `FLUENT_BIT_IMAGE`, `VECTOR_IMAGE` | `fluent/fluent-bit:5.1.2`, `timberio/vector:0.58.0-debian` | their images |
-| `LOADS` | `20x500 40x500 40x1000 60x1000` | `ceiling`: the loads |
+| `LOADS`, `LOAD_SECONDS`, `CEILING_CPUS` | `10x500 20x500 40x500 60x500`, `60`, `0.25` | `ceiling`: the loads, how long each lasts, and the agent's CPU limit |
 | `REPLAY` | | a log file whose lines the generators write instead of filler, for text that compresses like real logs do |
 | `ES_ADDRESS` | | an Elasticsearch to use; without it one is started in a container, on `ES_PORT` (`19200`) |
 | `PYTHON` | `python3` | a Python with matplotlib, for the charts |

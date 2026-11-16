@@ -25,7 +25,12 @@ REPO=$(cd "$EXP/.." && pwd)
 : "${LINK_RTT:=100}"       # its round trip, in milliseconds
 : "${LINK_LOSS:=5}"        # the packets it loses, in percent, each way
 : "${BURST_X:=5}"          # a burst: how many times the load
-: "${STORE_QUOTA:=256KiB}" # a full store: the most the agent's store may hold
+# A full store: the most the agent's store may hold - less than a node's load
+# takes, and the text of a real log takes more than filler does.
+if [ -z "${STORE_QUOTA:-}" ]; then
+	STORE_QUOTA=512KiB
+	[ -z "$REPLAY" ] || STORE_QUOTA=1MiB
+fi
 
 : "${ES_PORT:=19200}" "${ES_VERSION:=9.5.5}"
 : "${GRPC_PORT:=50071}" "${HTTP_PORT:=18071}" "${NODE_PORT_BASE:=21000}"
@@ -370,6 +375,30 @@ wait_indexed() { # <index prefix> <lines expected>
 		fi
 		if awk -v a="$start" -v b="$now" -v t="$INDEX_TIMEOUT" 'BEGIN { exit !(b - a > t) }'; then
 			log "only ${have:-0} of $2 lines searchable after $INDEX_TIMEOUT s"
+			return 1
+		fi
+		sleep 1
+	done
+}
+
+# wait_delivered waits until the agent of node 1 has turned that many lines
+# into files and the server has put as many rows into its archive, and prints
+# how long that took; it fails after the seconds given. This is the agent's
+# part of the way: the server's indexing comes after it.
+wait_delivered() { # <lines> <seconds>
+	local start now rows got
+	start=$(date +%s.%N)
+	while :; do
+		rows=$(scrape "http://127.0.0.1:$((NODE_PORT_BASE + 1))" |
+			awk '$1 == "cosmicdust_agent_store_rows_total{table=\"logs\"}" { printf "%d", $2 }')
+		got=$(server_metric cosmicdust_server_archive_rows_total | awk '{ printf "%d", $1 }')
+		now=$(date +%s.%N)
+		if [ "${rows:-0}" -ge "$1" ] && [ "${got:-0}" -ge "$1" ]; then
+			awk -v a="$start" -v b="$now" 'BEGIN { printf "%.1f\n", b - a }'
+			return 0
+		fi
+		if awk -v a="$start" -v b="$now" -v t="$2" 'BEGIN { exit !(b - a > t) }'; then
+			log "only ${got:-0} of $1 lines at the server after $2 s (the agent has stored ${rows:-0})"
 			return 1
 		fi
 		sleep 1
