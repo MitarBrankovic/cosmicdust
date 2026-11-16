@@ -59,9 +59,10 @@ need() {
 	[ -z "$REPLAY" ] || [ -r "$REPLAY" ] || die "cannot read REPLAY=$REPLAY"
 }
 
-# build makes everything a run needs: the server and the verifier for the
-# host, the node's image with the agent and the generator inside, and the
-# agent as an image of its own, for the runs that put it in a container.
+# build makes everything a run needs: the server and the tools that check a
+# run for the host, the node's image with the agent and the generator inside,
+# and the agent as an image of its own, for the runs that put it in a
+# container.
 build() {
 	BIN=$OUT/bin
 	local ctx=$OUT/build
@@ -70,6 +71,8 @@ build() {
 	(cd "$REPO" &&
 		go build -o "$BIN/cosmicdust-server" ./cmd/server &&
 		go build -o "$BIN/verify" ./experiments/cmd/verify &&
+		go build -o "$BIN/latency" ./experiments/cmd/latency &&
+		go build -o "$BIN/events" ./experiments/cmd/events &&
 		CGO_ENABLED=0 go build -o "$ctx/cosmicdust-agent" ./cmd/agent &&
 		CGO_ENABLED=0 go build -o "$ctx/loggen" ./experiments/cmd/loggen) || die "build failed"
 	cp "$EXP/node/entrypoint.sh" "$ctx/entrypoint.sh"
@@ -115,11 +118,14 @@ es_drop() {
 	curl -fs -XDELETE "$ES_ADDRESS/_index_template/$1-*" >/dev/null 2>&1 || true
 }
 
-# es_lines is how many log lines of a run are searchable.
-es_lines() {
-	curl -fs "$ES_ADDRESS/$1-logs-*/_count?ignore_unavailable=true&allow_no_indices=true" 2>/dev/null |
+# es_count is how many rows of a run's table (logs, events) are searchable.
+es_count() { # <index prefix> <table>
+	curl -fs "$ES_ADDRESS/$1-$2-*/_count?ignore_unavailable=true&allow_no_indices=true" 2>/dev/null |
 		sed -n 's/.*"count":\([0-9]*\).*/\1/p'
 }
+
+# es_lines is how many log lines of a run are searchable.
+es_lines() { es_count "$1" logs; }
 
 net_up() {
 	docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
@@ -243,9 +249,10 @@ nodes_stop() {
 }
 
 # generator_args are loggen's arguments for count lines at rate lines per
-# second, of filler or - with REPLAY - of a real log's text.
+# second, of filler or - with REPLAY - of a real log's text. GENERATOR_ARGS
+# are more of them.
 generator_args() { # <id> <rate> <count>
-	echo "-id $1 -rate $2 -count $3${REPLAY:+ -replay /data/replay.log}"
+	echo "-id $1 -rate $2 -count $3${REPLAY:+ -replay /data/replay.log}${GENERATOR_ARGS:+ $GENERATOR_ARGS}"
 }
 
 # generator_mounts gives a generator the log it replays.
@@ -356,6 +363,12 @@ busy_cores() { # <machine before> <machine after>
 	echo "$1 $2" | awk -v n="$(nproc)" '{ d = $4 - $2; printf "%.2f\n", (d > 0 ? n * ($3 - $1) / d : 0) }'
 }
 
+# clock_offset is the machine's wall clock against the one that only runs
+# forward (its uptime). Two of them say whether the wall clock was set in
+# between. The times of lines and events are wall clock times: across a step
+# of it some of them are out of order, and what was timed is off by the step.
+clock_offset() { awk -v now="$(date +%s.%N)" '{ printf "%.2f\n", now - $1 }' /proc/uptime; }
+
 # wait_indexed waits until a run's lines are all searchable and prints how
 # long that took; it fails once INDEX_TIMEOUT has passed. Where the agents may
 # drop lines for room (MAY_DROP is the number of nodes), a line an agent says
@@ -418,11 +431,18 @@ begin() { # <experiment> <x> <series> <round>
 	mkdir -p "$RUN"
 	teardown
 	es_drop "$PREFIX"
+	CLOCK=$(clock_offset)
 }
 
 # emit adds one measured value of the run in progress.
 emit() { # <metric> <value>
 	echo "$EXPERIMENT,$X,$SERIES,$ROUND,$1,$2" >>"$RUN/rows.csv"
+}
+
+# emit_as adds a value under another series: for a run that measures several
+# things side by side.
+emit_as() { # <series> <metric> <value>
+	echo "$EXPERIMENT,$X,$1,$ROUND,$2,$3" >>"$RUN/rows.csv"
 }
 
 # verified reads every generator's lines back through the query API and
@@ -459,8 +479,10 @@ verified() { # <generators per node> <lines per generator> <node>...
 	return 1
 }
 
-# finish stops everything and hands the run's values to the session.
+# finish stops everything and hands the run's values to the session, with
+# the seconds the wall clock was set by since the run began.
 finish() {
+	emit clock_set_s "$(awk -v a="$CLOCK" -v b="$(clock_offset)" 'BEGIN { d = b - a; printf "%.2f", (d < 0 ? -d : d) }')"
 	teardown
 	es_drop "$PREFIX"
 	cat "$RUN/rows.csv" >>"$OUT/runs.csv"

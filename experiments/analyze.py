@@ -21,6 +21,7 @@ then show the single run.
 import csv
 import statistics
 import sys
+import textwrap
 from collections import defaultdict
 from pathlib import Path
 
@@ -30,7 +31,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 # Per experiment: what its axis is, the order of its places if they are
-# names, and the values that get a chart, with what the chart's axis says.
+# names, the order of its series if it is not that of the alphabet, and the
+# values that get a chart, with what the chart's axis says. A name that ends
+# in * stands for every value that begins so, each with a chart of its own;
+# what the * stood for goes into the label's {}.
 EXPERIMENTS = {
     "nodes": {
         "axis": "nodes",
@@ -67,7 +71,8 @@ EXPERIMENTS = {
         },
     },
     "ceiling": {
-        "axis": "lines per second",
+        # What was asked of the generators; what they managed is written_per_s.
+        "axis": "lines per second asked for",
         "charts": {
             "collector_cpu_pct": "CPU of the agent (% of one core)",
             "throttled_s": "time the agent was held back by its CPU limit (s)",
@@ -77,6 +82,37 @@ EXPERIMENTS = {
             "settle_s": "until every line is searchable (s)",
             "written_per_s": "lines per second the generators managed",
             "runtime_cpu_pct": "CPU of the node's runtime: dockerd, containerd, shims (% of one core)",
+        },
+    },
+    "compress": {
+        "axis": "log",
+        "series": ["agent", "gzip-6", "zstd-3", "zstd-19", "messages-zstd-3"],
+        "charts": {
+            "ratio_*": "bytes of the log files / bytes kept (files of {})",
+        },
+    },
+    "latency": {
+        "axis": "setting",
+        "order": ["s1", "s2", "default", "s30", "s60"],
+        "series": ["server", "search", "urgent", "agent"],
+        "charts": {
+            "p50_s": "half of them are there within (s)",
+            "p95_s": "95 % of the lines are there within (s)",
+            "p99_s": "99 % of the lines are there within (s)",
+            "max_s": "the latest of them is there within (s)",
+            "agent_cpu_pct": "agent CPU (% of one core)",
+            "agent_rss_mb": "agent memory (MB resident)",
+            "files_per_min": "files of log lines the agent sent per minute",
+            "mb_received": "megabytes the server received",
+        },
+    },
+    "events": {
+        "axis": "what the agent did meanwhile",
+        "order": ["live", "kill9", "away"],
+        "charts": {
+            "recorded_pct": "exits of containers that were recorded (%)",
+            "final_right_pct": "containers whose last event leaves them in the right state (%)",
+            "inferred_pct": "exit events concluded from a listing (%)",
         },
     },
 }
@@ -114,6 +150,13 @@ def places(experiment, xs):
     return [x for x in order if x in xs] + sorted(xs - set(order))
 
 
+def in_order(experiment, series):
+    """The series of an experiment, in the order they are shown."""
+    series = set(series)
+    order = EXPERIMENTS.get(experiment, {}).get("series", [])
+    return [s for s in order if s in series] + sorted(series - set(order))
+
+
 def summarize(values):
     rows = []
     for (experiment, x, series, metric), v in values.items():
@@ -144,7 +187,7 @@ def print_summary(values):
     for experiment in sorted({e for (e, _, _, _) in values}):
         axis = EXPERIMENTS.get(experiment, {}).get("axis", "x")
         xs = places(experiment, [x for (e, x, _, _) in values if e == experiment])
-        for series in sorted({s for (e, _, s, _) in values if e == experiment}):
+        for series in in_order(experiment, {s for (e, _, s, _) in values if e == experiment}):
             print(f"\n{experiment}: {series}")
             print(f"  {axis:34}" + "".join(f"{x:>22}" for x in xs))
             metrics = sorted({m for (e, _, s, m) in values if e == experiment and s == series})
@@ -162,12 +205,21 @@ def print_summary(values):
     print("\n  median [least..most] over the runs")
 
 
+def named(values, experiment, name):
+    """The values a chart's name stands for, and for each what goes into the label."""
+    if not name.endswith("*"):
+        return [(name, "")]
+    stem = name[:-1]
+    found = {m for (e, _, _, m) in values if e == experiment and m.startswith(stem)}
+    return [(m, m[len(stem):]) for m in sorted(found, key=lambda m: (len(m), m))]
+
+
 def chart(values, experiment, metric, label, out):
     keys = [(x, s) for (e, x, s, m) in values if e == experiment and m == metric]
     if not keys:
         return False
     xs = places(experiment, [x for x, _ in keys])
-    series = sorted({s for _, s in keys})
+    series = in_order(experiment, {s for _, s in keys})
     lines = numeric(xs)
     top = max(max(values[(experiment, x, s, metric)]) for x, s in keys)
     fig, ax = plt.subplots(figsize=(6.4, 4.0) if lines else (max(6.4, 1.1 * len(xs) + 2), 4.0))
@@ -199,13 +251,16 @@ def chart(values, experiment, metric, label, out):
     else:
         ax.set_xticks(range(len(xs)), xs)
     ax.set_xlabel(EXPERIMENTS.get(experiment, {}).get("axis", "x"))
-    ax.set_ylabel(label)
+    # A long label on two lines: on one it would not fit the chart's height.
+    ax.set_ylabel("\n".join(textwrap.wrap(label, 44)))
     ax.set_ylim(bottom=0, top=top * 1.15 if top > 0 else 1)
     ax.grid(axis="y", alpha=0.3)
-    ax.legend(title="median, range of the runs", frameon=False)
+    # Above the chart: inside it, bars that fill it leave the legend no room.
+    ax.legend(title="median, range of the runs", frameon=False, loc="lower center", bbox_to_anchor=(0.5, 1.0),
+              ncol=min(len(series), 5))
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        fig.savefig(out / f"{experiment}-{metric}.{ext}", dpi=150)
+        fig.savefig(out / f"{experiment}-{metric}.{ext}", dpi=150, bbox_inches="tight")
     plt.close(fig)
     return True
 
@@ -222,8 +277,9 @@ def main():
     figures.mkdir(exist_ok=True)
     drawn = 0
     for experiment, spec in EXPERIMENTS.items():
-        for metric, label in spec["charts"].items():
-            drawn += chart(values, experiment, metric, label, figures)
+        for name, label in spec["charts"].items():
+            for metric, rest in named(values, experiment, name):
+                drawn += chart(values, experiment, metric, label.replace("{}", rest), figures)
     print_summary(values)
     print(f"\n  {results / 'summary.csv'}; {drawn} charts in {figures}")
 

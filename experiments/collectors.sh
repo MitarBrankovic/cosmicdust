@@ -49,6 +49,12 @@ load_of() { # <case>
 	fi
 }
 
+compare_need() {
+	case " $SUBJECTS " in
+	*" vector "*) command -v zstdcat >/dev/null || die "zstdcat is not installed (Vector's output is counted with it)" ;;
+	esac
+}
+
 compare_units() { # "<case> <collector>"
 	local c s
 	for c in $CASES; do

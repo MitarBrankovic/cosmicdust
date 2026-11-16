@@ -20,7 +20,10 @@ the server over gRPC, through the gateway of a Docker network.
 | `nodes` | the whole system: the server and 1 to 10 nodes, each limited to `NODE_CPUS` and `NODE_MEM` | number of nodes | scenario |
 | `adverse` | the same system where things are hard for a node: a narrow link, a burst, a full store | number of nodes | scenario |
 | `compare` | one roomy node with a log collector in it as a container, under limits of its own | case | collector: the agent, Fluent Bit, Vector |
-| `ceiling` | the same with the agent alone, under growing loads | lines per second | the agent |
+| `ceiling` | the same with the agent alone, under growing loads | lines per second asked for | the agent |
+| `compress` | one roomy node whose agent sends nothing, and generators that write the lines of a real log | log | what kept the logs: the agent, gzip, zstd |
+| `latency` | the server and one node under a steady load, the agent set to be more or less fresh | setting | what was timed: a line to the server, a line to the search, an urgent event |
+| `events` | the server and one node on which a script plays the lifecycles of containers | what the agent does meanwhile | the agent |
 
 ### nodes
 
@@ -75,18 +78,96 @@ and its run ends when every line can be searched there. Fluent Bit tails and wri
 parses and writes a zstd file. The comparison is what a node pays for its log collector, not a benchmark of equal
 pipelines.
 
+### compress
+
+What the agent's store makes of real logs, against compressing the log files the node's Docker wrote. It takes real
+logs, given as `DATASETS="<name>=<file> ..."` (or the one in `REPLAY`), and is left out without any: filler compresses
+like no log does. Public collections of logs, such as [Loghub](https://github.com/logpai/loghub), have them from
+many kinds of systems.
+
+A run takes one log and one length of file. `COMPRESS_CONTAINERS` generators write the log's lines as they are, at
+`COMPRESS_RATE` lines a second each. The agent turns what it has read into Parquet every `FILE_SECONDS` seconds, so
+each of its files holds that many seconds of logs; it sends nothing and merges nothing. The log files are then cut
+into pieces of the same length, and each piece is compressed on its own:
+
+| Series | What is kept |
+|---|---|
+| `agent` | the agent's Parquet files |
+| `gzip-6`, `zstd-3`, `zstd-19` | the log files, compressed with `gzip -6`, `zstd -3` and `zstd -19` |
+| `messages-zstd-3` | the text of the lines alone, without the JSON the runtime wraps each of them in, with `zstd -3`: how much of the log files is the wrapping |
+
+The value is `ratio_<seconds>s`, bytes of the log files over bytes kept, one for every length of file; what the run
+itself was like is under a series named after that length (`60s`). The bytes do not depend on how busy the machine
+is, so this experiment does not need a quiet one.
+
+### latency
+
+How late a line is, by how fresh the agent is set to be, and what the freshness costs. A line waits three times on
+its node: in the open segment of the agent's write-ahead log until that is sealed, in the sealed segment until the
+next conversion to Parquet, and in the Parquet file until the next sync. A setting is those three periods:
+
+| Setting | Segment sealed after | Conversion every | Sync every |
+|---|---|---|---|
+| `s1` | 1 s | 2 s | 2 s |
+| `s2` | 2 s | 5 s | 5 s |
+| `default` | 5 s | 10 s | 10 s |
+| `s30` | 10 s | 30 s | 30 s |
+| `s60` | 30 s | 60 s | 60 s |
+
+Any other can be written `<segment>-<conversion>-<sync>`, in seconds. A run is one node whose `LATENCY_CONTAINERS`
+generators write `LATENCY_RATE` lines a second each for `LATENCY_SECONDS` seconds; every `LATENCY_CRASH_EVERY`
+seconds a container fails on it, which the agent reports at once as an urgent event, on a way of its own. What is
+timed comes from the server's own record of when each file arrived and when its rows were indexed
+([`cmd/latency`](cmd/latency/main.go)), for every line:
+
+| Series | From | To |
+|---|---|---|
+| `server` | the time the node's runtime took the line | the server has the file that holds it |
+| `search` | the same | the server has put the line into the search index |
+| `urgent` | the end of the process of a container that failed | the urgent event is at the server |
+| `agent` | | what the agent cost and sent meanwhile, and whether every line came back once |
+
+### events
+
+The lifecycle events of containers, against a script that knows what happened. Every run plays the same lifecycles
+on one node, with containers of `EVENTS_IMAGE`:
+
+| Container | What happens to it | Exits that must be recorded | Left |
+|---|---|---|---|
+| `ev-ok`, `ev-fail` | end on their own, with 0 and with 3 | one each, with its code | exited |
+| `ev-stop`, `ev-kill` | `docker stop`, `docker kill` | one each, 137 | exited |
+| `ev-oom`, `ev-oom-fast` | killed by the kernel for memory, after a moment and at once | one each, 137, for memory | exited |
+| `ev-policy` | fails under a restart policy that gives up after three restarts | four, one per incarnation | exited |
+| `ev-restart` | `docker restart` | one, 137 | running |
+| `ev-pause` | paused and continued | none | running |
+| `ev-rm` | removed while it runs | one, 137 | removed |
+| `ev-ctr` | run by containerd without Docker, ends with 2 | one | exited |
+
+The events are then read through the query API and compared with that ([`cmd/events`](cmd/events/main.go)). A mode
+is what the agent does while the script plays:
+
+| Mode | The agent | What it has to go on |
+|---|---|---|
+| `live` | runs all along | the event streams of the runtimes |
+| `kill9` | is killed with `kill -9` twice and started again | the streams, and a listing for what it missed |
+| `away` | is stopped before the lifecycles and started after them | a listing alone |
+
+A listing shows what is, not what was. An exit that a later start of the same container hides, the incarnations a
+restart policy went through before the last, and anything of a container that is gone cannot be concluded from it:
+in `away`, those are missing by design, and the run says how many.
+
 ## What a run measures
 
 | Value | Experiments | |
 |---|---|---|
-| `exactly_once` | all, for the agent | 1 if every line of every generator came back through the query API once: none missing, none twice ([`cmd/verify`](cmd/verify/main.go)); in `evict`, none missing but the ones recorded as dropped |
-| `lines_expected`, `lines_stored`, `lines_missing`, `lines_duplicate` | all | the lines behind that; for Fluent Bit and Vector, `lines_stored` is the lines in their output file |
-| `agent_cpu_pct`, `agent_cpu_pct_max` | `nodes`, `adverse` | CPU of the agent while the generators wrote, in percent of one core: the mean of the nodes and the busiest node |
-| `agent_rss_mb`, `agent_rss_mb_max` | `nodes`, `adverse` | resident memory of the agent, the most seen: the mean of the nodes and the largest |
-| `server_cpu_pct`, `server_rss_mb` | `nodes`, `adverse` | the same for the server |
-| `settle_s` | all, for the agent | seconds until every line can be searched, from the end of the load (or, where the server was away, from its return) |
-| `scenario_s` | `nodes`, `adverse` | seconds from the first line to the end of the scenario's part: more than planned if a node could not write as fast as asked |
-| `urgent_expected`, `urgent_delivered` | `outage`, `narrow` | containers that failed while the server was away, and how many of them it was told about at once after its return |
+| `exactly_once` | all but `compress`, for the agent | 1 if every line of every generator came back through the query API once: none missing, none twice ([`cmd/verify`](cmd/verify/main.go)); in `evict`, none missing but the ones recorded as dropped |
+| `lines_expected`, `lines_stored`, `lines_missing`, `lines_duplicate` | all but `compress` | the lines behind that; for Fluent Bit and Vector, `lines_stored` is the lines in their output file |
+| `agent_cpu_pct`, `agent_cpu_pct_max` | `nodes`, `adverse`, `latency` | CPU of the agent while the generators wrote, in percent of one core: the mean of the nodes and the busiest node |
+| `agent_rss_mb`, `agent_rss_mb_max` | `nodes`, `adverse`, `latency` | resident memory of the agent, the most seen: the mean of the nodes and the largest |
+| `server_cpu_pct`, `server_rss_mb` | `nodes`, `adverse`, `latency` | the same for the server |
+| `settle_s` | all but `compress`, for the agent | seconds until every line can be searched, from the end of the load (or, where the server was away, from its return) |
+| `scenario_s` | `nodes`, `adverse`, `latency`, `events` | seconds from the first line to the end of the scenario's part: more than planned if a node could not write as fast as asked; in `events`, the seconds the lifecycles took |
+| `urgent_expected`, `urgent_delivered` | `outage`, `narrow`, `latency` | containers that failed (in `outage` and `narrow`, while the server was away), and how many of them the server was told about on the urgent way |
 | `link_mb`, `link_lost_pct` | `narrow` | what the narrow links carried to the server, and the share of the packets they lost on the way |
 | `lines_dropped`, `dropped_pct` | `evict`, `block` | lines the agents dropped for room, as they count them, and their share of the lines written |
 | `store_full_times` | `evict`, `block` | how many times an agent stopped reading because its store was full |
@@ -99,10 +180,23 @@ pipelines.
 | `delivered_s` | `compare`, `ceiling`, for the agent | seconds from the end of the load until the agent has stored every line and the server has as many rows in its archive |
 | `written_per_s` | `compare`, `ceiling` | lines per second the generators managed to write: less than asked for when the node itself is too busy |
 | `throttled_s` | `compare`, `ceiling` | seconds the collector was held back by its CPU limit |
+| `ratio_<seconds>s` | `compress` | bytes of the log files over bytes kept, with that many seconds of logs to a file |
+| `files`, `file_mb` | `compress` | the Parquet files the agent made of the log lines, and their mean size |
+| `lines`, `stored_pct` | `compress` | lines written, and the share of them in the agent's Parquet files when the run ended; the agent's ratio is over those |
+| `log_mb`, `message_pct` | `compress` | the size of the log files, and the share of it that is the text of the lines |
+| `p50_s`, `p95_s`, `p99_s`, `max_s` | `latency` | seconds within which half, 95 % and 99 % of the lines were there, and the latest of them; for urgent events, half and the latest |
+| `files_per_min`, `mb_received` | `latency` | files of log lines the agent sent per minute of load, and megabytes the server received in all |
+| `lines_timed`, `log_files`, `events_timed` | `latency` | the lines, the files of log lines and the urgent events behind those values |
+| `exits_expected`, `exits_recorded`, `recorded_pct` | `events` | exits the script caused, and how many of them have an exit event of their incarnation that is not older than the incarnation's start |
+| `codes_right_pct`, `oom_right_pct` | `events` | of the exits recorded, those with the right exit code, and those that say rightly whether the kernel killed for memory |
+| `duplicates` | `events` | exits a runtime reported, or the agent concluded, more than once |
+| `exit_events`, `inferred_pct` | `events` | exit events in all (Docker and containerd each report an exit), and the share of them the agent concluded from a listing |
+| `containers`, `final_right_pct` | `events` | containers of the script, and the share whose last event leaves them in the state they are in |
 | `machine_busy_cores` | all | cores of the whole machine that were busy during the run: a run made while something else was busy is not worth keeping |
+| `clock_set_s` | all | seconds the machine's wall clock was set by during the run, against its uptime: the times of lines and events are wall clock times, so across a step of it some are out of order and what was timed is off by as much |
 
-In `nodes` the agents and the server are measured by what they report themselves (`process_cpu_seconds_total`,
-`process_resident_memory_bytes`), sampled every two seconds.
+In `nodes`, `adverse` and `latency` the agents and the server are measured by what they report themselves
+(`process_cpu_seconds_total`, `process_resident_memory_bytes`), sampled every two seconds.
 
 ## Results
 
@@ -136,6 +230,14 @@ makes the summary and the charts again.
 | `SUBJECTS` | `agent fluent-bit vector` | `compare`: the collectors |
 | `FLUENT_BIT_IMAGE`, `VECTOR_IMAGE` | `fluent/fluent-bit:5.1.2`, `timberio/vector:0.58.0-debian` | their images |
 | `LOADS`, `LOAD_SECONDS`, `CEILING_CPUS` | `10x500 20x500 40x500 60x500`, `60`, `0.25` | `ceiling`: the loads, how long each lasts, and the agent's CPU limit |
+| `DATASETS` | | `compress`: the logs, as `<name>=<file>`, space separated; without it, the one in `REPLAY` |
+| `FILE_SECONDS` | `10 60 300` | `compress`: seconds of logs in one of the agent's files |
+| `COMPRESS_CONTAINERS`, `COMPRESS_RATE`, `REPLAY_LINES` | `4`, `500`, `300000` | `compress`: generators, lines per second of each, and the lines of a log one writes before it starts over |
+| `SETTINGS` | `s1 s2 default s30 s60` | `latency`: the settings, space separated |
+| `LATENCY_CONTAINERS`, `LATENCY_RATE`, `LATENCY_SECONDS` | `10`, `100`, `180` | `latency`: generators, lines per second of each, seconds of load |
+| `LATENCY_CRASH_EVERY` | `15` | `latency`: seconds between two containers that fail |
+| `MODES` | `live kill9 away` | `events`: the modes, space separated |
+| `EVENTS_IMAGE` | `alpine:3` | `events`: the image of the script's containers; anything with a shell, `sleep` and `dd` |
 | `REPLAY` | | a log file whose lines the generators write instead of filler, for text that compresses like real logs do |
 | `ES_ADDRESS` | | an Elasticsearch to use; without it one is started in a container, on `ES_PORT` (`19200`) |
 | `PYTHON` | `python3` | a Python with matplotlib, for the charts |
@@ -143,6 +245,6 @@ makes the summary and the charts again.
 ## What it needs
 
 Docker that can run privileged containers (the nodes are Docker in Docker), Go, curl, and Python 3 with matplotlib;
-`zstdcat` to count Vector's output; for `narrow`, a kernel with netem and ifb. About 2 GB of memory for
+`zstdcat` to count Vector's output; `gzip` and `zstd` for `compress`; for `narrow`, a kernel with netem and ifb. About 2 GB of memory for
 Elasticsearch, `NODE_MEM` for every node of `nodes` and `adverse`, and 4 GB for the node of `compare` and `ceiling`. For numbers worth keeping, a machine that does nothing else: the nodes,
 the server and Elasticsearch share its cores.

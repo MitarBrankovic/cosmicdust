@@ -5,7 +5,9 @@
 # killed is started again a second later.
 #
 # With NODE_AGENT=off the node runs no agent of its own: whoever started it
-# puts a log collector in, as a container.
+# puts a log collector in, as a container. While /run/agent-hold exists the
+# agent is not started: a run that wants the node without its agent for a
+# while puts the file there and stops the agent.
 set -eu
 
 dockerd-entrypoint.sh dockerd >/var/log/dockerd.log 2>&1 &
@@ -21,6 +23,8 @@ if [ "${NODE_AGENT:-on}" = off ]; then
 	while :; do sleep 3600; done
 fi
 while :; do
-	cosmicdust-agent >>/var/log/agent.log 2>&1 || true
+	if [ ! -e /run/agent-hold ]; then
+		cosmicdust-agent >>/var/log/agent.log 2>&1 || true
+	fi
 	sleep 1
 done
