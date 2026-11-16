@@ -31,9 +31,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 # Per experiment: what its axis is, the order of its places if they are
-# names, and the values that get a chart, with what the chart's axis says. A
-# name that ends in * stands for every value that begins so, each with a chart
-# of its own; what the * stood for goes into the label's {}.
+# names, the order of its series if it is not that of the alphabet, and the
+# values that get a chart, with what the chart's axis says. A name that ends
+# in * stands for every value that begins so, each with a chart of its own;
+# what the * stood for goes into the label's {}.
 EXPERIMENTS = {
     "nodes": {
         "axis": "nodes",
@@ -85,8 +86,24 @@ EXPERIMENTS = {
     },
     "compress": {
         "axis": "log",
+        "series": ["agent", "gzip-6", "zstd-3", "zstd-19", "messages-zstd-3"],
         "charts": {
-            "ratio_*": "bytes of the log files / bytes kept, a file holding {} of logs",
+            "ratio_*": "bytes of the log files / bytes kept (files of {})",
+        },
+    },
+    "latency": {
+        "axis": "setting",
+        "order": ["s1", "s2", "default", "s30", "s60"],
+        "series": ["server", "search", "urgent", "agent"],
+        "charts": {
+            "p50_s": "half of them are there within (s)",
+            "p95_s": "95 % of the lines are there within (s)",
+            "p99_s": "99 % of the lines are there within (s)",
+            "max_s": "the latest of them is there within (s)",
+            "agent_cpu_pct": "agent CPU (% of one core)",
+            "agent_rss_mb": "agent memory (MB resident)",
+            "files_per_min": "files of log lines the agent sent per minute",
+            "mb_received": "megabytes the server received",
         },
     },
 }
@@ -124,6 +141,13 @@ def places(experiment, xs):
     return [x for x in order if x in xs] + sorted(xs - set(order))
 
 
+def in_order(experiment, series):
+    """The series of an experiment, in the order they are shown."""
+    series = set(series)
+    order = EXPERIMENTS.get(experiment, {}).get("series", [])
+    return [s for s in order if s in series] + sorted(series - set(order))
+
+
 def summarize(values):
     rows = []
     for (experiment, x, series, metric), v in values.items():
@@ -154,7 +178,7 @@ def print_summary(values):
     for experiment in sorted({e for (e, _, _, _) in values}):
         axis = EXPERIMENTS.get(experiment, {}).get("axis", "x")
         xs = places(experiment, [x for (e, x, _, _) in values if e == experiment])
-        for series in sorted({s for (e, _, s, _) in values if e == experiment}):
+        for series in in_order(experiment, {s for (e, _, s, _) in values if e == experiment}):
             print(f"\n{experiment}: {series}")
             print(f"  {axis:34}" + "".join(f"{x:>22}" for x in xs))
             metrics = sorted({m for (e, _, s, m) in values if e == experiment and s == series})
@@ -186,7 +210,7 @@ def chart(values, experiment, metric, label, out):
     if not keys:
         return False
     xs = places(experiment, [x for x, _ in keys])
-    series = sorted({s for _, s in keys})
+    series = in_order(experiment, {s for _, s in keys})
     lines = numeric(xs)
     top = max(max(values[(experiment, x, s, metric)]) for x, s in keys)
     fig, ax = plt.subplots(figsize=(6.4, 4.0) if lines else (max(6.4, 1.1 * len(xs) + 2), 4.0))
@@ -222,10 +246,12 @@ def chart(values, experiment, metric, label, out):
     ax.set_ylabel("\n".join(textwrap.wrap(label, 44)))
     ax.set_ylim(bottom=0, top=top * 1.15 if top > 0 else 1)
     ax.grid(axis="y", alpha=0.3)
-    ax.legend(title="median, range of the runs", frameon=False)
+    # Above the chart: inside it, bars that fill it leave the legend no room.
+    ax.legend(title="median, range of the runs", frameon=False, loc="lower center", bbox_to_anchor=(0.5, 1.0),
+              ncol=min(len(series), 5))
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        fig.savefig(out / f"{experiment}-{metric}.{ext}", dpi=150)
+        fig.savefig(out / f"{experiment}-{metric}.{ext}", dpi=150, bbox_inches="tight")
     plt.close(fig)
     return True
 

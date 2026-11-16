@@ -59,9 +59,10 @@ need() {
 	[ -z "$REPLAY" ] || [ -r "$REPLAY" ] || die "cannot read REPLAY=$REPLAY"
 }
 
-# build makes everything a run needs: the server and the verifier for the
-# host, the node's image with the agent and the generator inside, and the
-# agent as an image of its own, for the runs that put it in a container.
+# build makes everything a run needs: the server and the tools that check a
+# run for the host, the node's image with the agent and the generator inside,
+# and the agent as an image of its own, for the runs that put it in a
+# container.
 build() {
 	BIN=$OUT/bin
 	local ctx=$OUT/build
@@ -70,6 +71,7 @@ build() {
 	(cd "$REPO" &&
 		go build -o "$BIN/cosmicdust-server" ./cmd/server &&
 		go build -o "$BIN/verify" ./experiments/cmd/verify &&
+		go build -o "$BIN/latency" ./experiments/cmd/latency &&
 		CGO_ENABLED=0 go build -o "$ctx/cosmicdust-agent" ./cmd/agent &&
 		CGO_ENABLED=0 go build -o "$ctx/loggen" ./experiments/cmd/loggen) || die "build failed"
 	cp "$EXP/node/entrypoint.sh" "$ctx/entrypoint.sh"

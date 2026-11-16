@@ -9,8 +9,8 @@
 #   experiments/run.sh -n 5 -o <directory>     continue a session that was interrupted
 #
 #   -n <rounds>       how many times every run is made (default 3)
-#   -e <experiments>  nodes, adverse, compare, ceiling, compress; comma
-#                     separated (default all)
+#   -e <experiments>  nodes, adverse, compare, ceiling, compress, latency;
+#                     comma separated (default all)
 #   -s <scenarios>    nodes: steady, outage, churn (default all)
 #   -k <nodes>        nodes and adverse: numbers of nodes (default 1,3,5,10)
 #   -o <directory>    where the results go (default experiments/results/<time>);
@@ -30,6 +30,8 @@
 #   compress what the agent's store makes of real logs, against gzip and zstd
 #            over the log files (compress.sh; DATASETS, FILE_SECONDS); left
 #            out when no real log is given
+#   latency  how late a line is at the server and in the search, by how fresh
+#            the agent is set to be (latency.sh; SETTINGS)
 #
 # The rest is set from the environment (lib.sh, collectors.sh): CONTAINERS,
 # RATE, DURATION, NODE_CPUS, NODE_MEM, REPLAY, ES_ADDRESS, PYTHON.
@@ -46,13 +48,15 @@
 set -u
 
 quick_cases=${CASES-} quick_loads=${LOADS-} quick_quota=${STORE_QUOTA-} quick_files=${FILE_SECONDS-}
+quick_settings=${SETTINGS-}
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 . "$EXP/nodes.sh"
 . "$EXP/collectors.sh"
 . "$EXP/compress.sh"
+. "$EXP/latency.sh"
 
 ROUNDS=3
-EXPERIMENTS=nodes,adverse,compare,ceiling,compress
+EXPERIMENTS=nodes,adverse,compare,ceiling,compress,latency
 OUT=
 while getopts "n:e:s:k:o:qh" opt; do
 	case $opt in
@@ -68,6 +72,8 @@ while getopts "n:e:s:k:o:qh" opt; do
 		# Small enough for so few lines to fill it.
 		[ -n "$quick_quota" ] || STORE_QUOTA=32KiB
 		[ -n "$quick_files" ] || FILE_SECONDS=10
+		LATENCY_CONTAINERS=2 LATENCY_RATE=50 LATENCY_SECONDS=30 LATENCY_CRASH_EVERY=10
+		[ -n "$quick_settings" ] || SETTINGS="s1 default"
 		;;
 	*)
 		sed -n '2,/^set -u/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
@@ -110,6 +116,7 @@ trap 'exit 130' INT TERM
 	echo "compare: cases $CASES; collectors $SUBJECTS ($FLUENT_BIT_IMAGE, $VECTOR_IMAGE)"
 	echo "ceiling: loads $LOADS for $LOAD_SECONDS s; the agent under $CEILING_CPUS CPU"
 	echo "compress: logs $(compress_logs | awk '{ printf "%s%s", sep, $0; sep = ", " }'); files of $FILE_SECONDS s; $COMPRESS_CONTAINERS generators x $COMPRESS_RATE lines/s"
+	echo "latency: settings $SETTINGS; $LATENCY_CONTAINERS generators x $LATENCY_RATE lines/s for $LATENCY_SECONDS s; a container fails every $LATENCY_CRASH_EVERY s"
 	echo "generators write: ${REPLAY:-filler}"
 	echo "go: $(go version | cut -d' ' -f3-)"
 	echo "docker: $(docker version --format '{{.Server.Version}}'); node image: $DIND"

@@ -22,6 +22,7 @@ the server over gRPC, through the gateway of a Docker network.
 | `compare` | one roomy node with a log collector in it as a container, under limits of its own | case | collector: the agent, Fluent Bit, Vector |
 | `ceiling` | the same with the agent alone, under growing loads | lines per second asked for | the agent |
 | `compress` | one roomy node whose agent sends nothing, and generators that write the lines of a real log | log | what kept the logs: the agent, gzip, zstd |
+| `latency` | the server and one node under a steady load, the agent set to be more or less fresh | setting | what was timed: a line to the server, a line to the search, an urgent event |
 
 ### nodes
 
@@ -98,6 +99,33 @@ The value is `ratio_<seconds>s`, bytes of the log files over bytes kept, one for
 itself was like is under a series named after that length (`60s`). The bytes do not depend on how busy the machine
 is, so this experiment does not need a quiet one.
 
+### latency
+
+How late a line is, by how fresh the agent is set to be, and what the freshness costs. A line waits three times on
+its node: in the open segment of the agent's write-ahead log until that is sealed, in the sealed segment until the
+next conversion to Parquet, and in the Parquet file until the next sync. A setting is those three periods:
+
+| Setting | Segment sealed after | Conversion every | Sync every |
+|---|---|---|---|
+| `s1` | 1 s | 2 s | 2 s |
+| `s2` | 2 s | 5 s | 5 s |
+| `default` | 5 s | 10 s | 10 s |
+| `s30` | 10 s | 30 s | 30 s |
+| `s60` | 30 s | 60 s | 60 s |
+
+Any other can be written `<segment>-<conversion>-<sync>`, in seconds. A run is one node whose `LATENCY_CONTAINERS`
+generators write `LATENCY_RATE` lines a second each for `LATENCY_SECONDS` seconds; every `LATENCY_CRASH_EVERY`
+seconds a container fails on it, which the agent reports at once as an urgent event, on a way of its own. What is
+timed comes from the server's own record of when each file arrived and when its rows were indexed
+([`cmd/latency`](cmd/latency/main.go)), for every line:
+
+| Series | From | To |
+|---|---|---|
+| `server` | the time the node's runtime took the line | the server has the file that holds it |
+| `search` | the same | the server has put the line into the search index |
+| `urgent` | the end of the process of a container that failed | the urgent event is at the server |
+| `agent` | | what the agent cost and sent meanwhile, and whether every line came back once |
+
 ## What a run measures
 
 | Value | Experiments | |
@@ -126,6 +154,9 @@ is, so this experiment does not need a quiet one.
 | `files`, `file_mb` | `compress` | the Parquet files the agent made of the log lines, and their mean size |
 | `lines`, `stored_pct` | `compress` | lines written, and the share of them in the agent's Parquet files when the run ended; the agent's ratio is over those |
 | `log_mb`, `message_pct` | `compress` | the size of the log files, and the share of it that is the text of the lines |
+| `p50_s`, `p95_s`, `p99_s`, `max_s` | `latency` | seconds within which half, 95 % and 99 % of the lines were there, and the latest of them; for urgent events, half and the latest |
+| `files_per_min`, `mb_received` | `latency` | files of log lines the agent sent per minute of load, and megabytes the server received in all |
+| `lines_timed`, `log_files`, `events_timed` | `latency` | the lines, the files of log lines and the urgent events behind those values |
 | `machine_busy_cores` | all | cores of the whole machine that were busy during the run: a run made while something else was busy is not worth keeping |
 
 In `nodes` the agents and the server are measured by what they report themselves (`process_cpu_seconds_total`,
@@ -166,6 +197,9 @@ makes the summary and the charts again.
 | `DATASETS` | | `compress`: the logs, as `<name>=<file>`, space separated; without it, the one in `REPLAY` |
 | `FILE_SECONDS` | `10 60 300` | `compress`: seconds of logs in one of the agent's files |
 | `COMPRESS_CONTAINERS`, `COMPRESS_RATE`, `REPLAY_LINES` | `4`, `500`, `300000` | `compress`: generators, lines per second of each, and the lines of a log one writes before it starts over |
+| `SETTINGS` | `s1 s2 default s30 s60` | `latency`: the settings, space separated |
+| `LATENCY_CONTAINERS`, `LATENCY_RATE`, `LATENCY_SECONDS` | `10`, `100`, `180` | `latency`: generators, lines per second of each, seconds of load |
+| `LATENCY_CRASH_EVERY` | `15` | `latency`: seconds between two containers that fail |
 | `REPLAY` | | a log file whose lines the generators write instead of filler, for text that compresses like real logs do |
 | `ES_ADDRESS` | | an Elasticsearch to use; without it one is started in a container, on `ES_PORT` (`19200`) |
 | `PYTHON` | `python3` | a Python with matplotlib, for the charts |
