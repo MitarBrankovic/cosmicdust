@@ -21,6 +21,7 @@ then show the single run.
 import csv
 import statistics
 import sys
+import textwrap
 from collections import defaultdict
 from pathlib import Path
 
@@ -67,7 +68,8 @@ EXPERIMENTS = {
         },
     },
     "ceiling": {
-        "axis": "lines per second",
+        # What was asked of the generators; what they managed is written_per_s.
+        "axis": "lines per second asked for",
         "charts": {
             "collector_cpu_pct": "CPU of the agent (% of one core)",
             "throttled_s": "time the agent was held back by its CPU limit (s)",
@@ -199,7 +201,8 @@ def chart(values, experiment, metric, label, out):
     else:
         ax.set_xticks(range(len(xs)), xs)
     ax.set_xlabel(EXPERIMENTS.get(experiment, {}).get("axis", "x"))
-    ax.set_ylabel(label)
+    # A long label on two lines: on one it would not fit the chart's height.
+    ax.set_ylabel("\n".join(textwrap.wrap(label, 44)))
     ax.set_ylim(bottom=0, top=top * 1.15 if top > 0 else 1)
     ax.grid(axis="y", alpha=0.3)
     ax.legend(title="median, range of the runs", frameon=False)

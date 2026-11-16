@@ -20,7 +20,7 @@ the server over gRPC, through the gateway of a Docker network.
 | `nodes` | the whole system: the server and 1 to 10 nodes, each limited to `NODE_CPUS` and `NODE_MEM` | number of nodes | scenario |
 | `adverse` | the same system where things are hard for a node: a narrow link, a burst, a full store | number of nodes | scenario |
 | `compare` | one roomy node with a log collector in it as a container, under limits of its own | case | collector: the agent, Fluent Bit, Vector |
-| `ceiling` | the same with the agent alone, under growing loads | lines per second | the agent |
+| `ceiling` | the same with the agent alone, under growing loads | lines per second asked for | the agent |
 
 ### nodes
 
