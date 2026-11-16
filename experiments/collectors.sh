@@ -9,7 +9,9 @@
 #
 #   compare  the agent against Fluent Bit and Vector over a set of cases; the
 #            axis is the case, a series is a collector
-#   ceiling  the agent alone under growing loads; the axis is lines per second
+#   ceiling  the agent alone under growing loads; the axis is lines per second.
+#            It gets a part of a core (CEILING_CPUS): a node of this kind
+#            cannot write as many lines as the agent reads with a whole one
 #
 # The three do not do the same work. The agent stores what it reads in
 # Parquet and sends it to the server, and its run ends when every line can be
@@ -19,10 +21,12 @@
 
 : "${CASES:=idle0 idle200 load1k load5k load10k edge25 edge10}"
 : "${SUBJECTS:=agent fluent-bit vector}"
-: "${LOADS:=20x500 40x500 40x1000 60x1000}"
+: "${LOADS:=10x500 20x500 40x500 60x500}"
+: "${CEILING_CPUS:=0.25}"
 : "${FLUENT_BIT_IMAGE:=fluent/fluent-bit:5.1.2}"
 : "${VECTOR_IMAGE:=timberio/vector:0.58.0-debian}"
 : "${COLLECTOR_NODE_CPUS:=8}" "${COLLECTOR_NODE_MEM:=4g}"
+: "${LOAD_SECONDS:=60}" # how long a load written "NxR" lasts
 
 # load_of sets what a case means: N containers of R lines per second for D
 # seconds, and the collector's limits. A case can also be written "NxR".
@@ -36,7 +40,7 @@ load_of() { # <case>
 	load10k) N=20 R=500 D=120 ;;
 	edge25) N=10 R=100 D=120 CPUS=0.25 MEM=128m ;; # a quarter of a core
 	edge10) N=10 R=100 D=120 CPUS=0.10 MEM=256m ;; # a tenth of a core
-	*x*) N=${1%x*} R=${1#*x} D=120 ;;
+	*x*) N=${1%x*} R=${1#*x} D=$LOAD_SECONDS CPUS=${LOAD_CPUS:-1} ;;
 	*) die "there is no case '$1'" ;;
 	esac
 	if [ -n "${QUICK:-}" ]; then # checks the chain, measures nothing
@@ -61,7 +65,7 @@ ceiling_units() { # "<lines per second> agent <load>"
 		echo "$((${l%x*} * ${l#*x})) agent $l"
 	done
 }
-ceiling_run() { collector_run ceiling "$1" "$2" "$4" "$3"; } # <lines per second> agent <round> <load>
+ceiling_run() { LOAD_CPUS=$CEILING_CPUS collector_run ceiling "$1" "$2" "$4" "$3"; } # <lines per second> agent <round> <load>
 
 # collector_image makes sure the collector's image is there as a tar file,
 # for the node to load.
@@ -145,7 +149,7 @@ cg_cpu() { cg_value "$1" cpu.stat usage_usec; }
 collector_run() { # <experiment> <x> <collector> <case> <round>
 	local subject=$3 c=$4 ids id paths="" count lines out cg failed=0 i
 	local from to before after u0 u1 u2 u3 n0 n1 r0 r1 th0 th1 anon peak settle have bytes
-	local cpu runtime rest throttled anonmb
+	local cpu runtime rest throttled anonmb read patience
 	load_of "$c"
 	begin "$1" "$2" "$subject" "$5"
 	log "$1: $c, $subject, round $5: $N x $R lines/s for $D s under $CPUS CPU and $MEM"
@@ -232,6 +236,12 @@ collector_run() { # <experiment> <x> <collector> <case> <round>
 	th1=$(cg_value "$cg" cpu.stat throttled_usec)
 	anon=$(cg_value "$cg" memory.stat anon)
 	lines=$((N * count))
+	if [ "$subject" = agent ]; then
+		# The moment the last line is written: what the agent has read by then,
+		# and what of it can already be searched.
+		read=$(agents_sum 1 cosmicdust_agent_tail_lines_total)
+		have=$(es_lines "$PREFIX")
+	fi
 
 	# The collector's CPU while the generators wrote (or, with none writing,
 	# for D seconds) and its anonymous memory at the end of that; the CPU of
@@ -248,14 +258,30 @@ collector_run() { # <experiment> <x> <collector> <case> <round>
 	emit throttled_s "$throttled"
 	emit collector_anon_mb "$anonmb"
 	emit lines_per_s $((N * R))
+	if [ "$R" -gt 0 ]; then
+		# What the generators managed: less than asked when the node is too busy.
+		emit written_per_s "$(awk -v a="$from" -v b="$to" -v l="$lines" 'BEGIN { printf "%.0f", l / (b - a) }')"
+	fi
 
 	case $subject in
 	agent)
-		# How far behind the agent was when the last line was written.
-		have=$(es_lines "$PREFIX")
-		[ "$lines" -gt 0 ] && emit behind_pct "$(awk -v h="${have:-0}" -v l="$lines" 'BEGIN { printf "%.1f", (h < l ? 100 * (l - h) / l : 0) }')"
-		if settle=$(wait_indexed "$PREFIX" "$lines"); then
-			emit settle_s "$settle"
+		# How far behind it all was when the last line was written: the agent
+		# in its reading, and the whole way to the search - on which the
+		# server's indexing has a say as well.
+		if [ "$lines" -gt 0 ]; then
+			emit unread_pct "$(awk -v h="${read:-0}" -v l="$lines" 'BEGIN { printf "%.1f", (h < l ? 100 * (l - h) / l : 0) }')"
+			emit behind_pct "$(awk -v h="${have:-0}" -v l="$lines" 'BEGIN { printf "%.1f", (h < l ? 100 * (l - h) / l : 0) }')"
+		fi
+		# The more lines, the longer the server may take to index them.
+		patience=$((INDEX_TIMEOUT + lines / 5000))
+		if settle=$(wait_delivered "$lines" "$patience"); then
+			emit delivered_s "$settle"
+		else
+			failed=1
+		fi
+		if settle=$(INDEX_TIMEOUT=$patience wait_indexed "$PREFIX" "$lines"); then
+			# From the end of the load, like delivered_s.
+			emit settle_s "$(since "$to")"
 		else
 			failed=1
 		fi

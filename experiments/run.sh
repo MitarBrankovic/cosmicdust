@@ -103,7 +103,7 @@ trap 'exit 130' INT TERM
 	echo "nodes: scenarios $SCENARIOS; sizes $NODES; per node $CONTAINERS generators x $RATE lines/s for $DURATION s; $NODE_CPUS CPU, $NODE_MEM"
 	echo "adverse: scenarios $ADVERSE; link $LINK_MBIT Mbit/s, round trip $LINK_RTT ms, loss $LINK_LOSS %; burst x$BURST_X; store quota $STORE_QUOTA"
 	echo "compare: cases $CASES; collectors $SUBJECTS ($FLUENT_BIT_IMAGE, $VECTOR_IMAGE)"
-	echo "ceiling: loads $LOADS"
+	echo "ceiling: loads $LOADS for $LOAD_SECONDS s; the agent under $CEILING_CPUS CPU"
 	echo "generators write: ${REPLAY:-filler}"
 	echo "go: $(go version | cut -d' ' -f3-)"
 	echo "docker: $(docker version --format '{{.Server.Version}}'); node image: $DIND"
