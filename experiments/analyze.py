@@ -31,7 +31,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 # Per experiment: what its axis is, the order of its places if they are
-# names, and the values that get a chart, with what the chart's axis says.
+# names, and the values that get a chart, with what the chart's axis says. A
+# name that ends in * stands for every value that begins so, each with a chart
+# of its own; what the * stood for goes into the label's {}.
 EXPERIMENTS = {
     "nodes": {
         "axis": "nodes",
@@ -79,6 +81,12 @@ EXPERIMENTS = {
             "settle_s": "until every line is searchable (s)",
             "written_per_s": "lines per second the generators managed",
             "runtime_cpu_pct": "CPU of the node's runtime: dockerd, containerd, shims (% of one core)",
+        },
+    },
+    "compress": {
+        "axis": "log",
+        "charts": {
+            "ratio_*": "bytes of the log files / bytes kept, a file holding {} of logs",
         },
     },
 }
@@ -164,6 +172,15 @@ def print_summary(values):
     print("\n  median [least..most] over the runs")
 
 
+def named(values, experiment, name):
+    """The values a chart's name stands for, and for each what goes into the label."""
+    if not name.endswith("*"):
+        return [(name, "")]
+    stem = name[:-1]
+    found = {m for (e, _, _, m) in values if e == experiment and m.startswith(stem)}
+    return [(m, m[len(stem):]) for m in sorted(found, key=lambda m: (len(m), m))]
+
+
 def chart(values, experiment, metric, label, out):
     keys = [(x, s) for (e, x, s, m) in values if e == experiment and m == metric]
     if not keys:
@@ -225,8 +242,9 @@ def main():
     figures.mkdir(exist_ok=True)
     drawn = 0
     for experiment, spec in EXPERIMENTS.items():
-        for metric, label in spec["charts"].items():
-            drawn += chart(values, experiment, metric, label, figures)
+        for name, label in spec["charts"].items():
+            for metric, rest in named(values, experiment, name):
+                drawn += chart(values, experiment, metric, label.replace("{}", rest), figures)
     print_summary(values)
     print(f"\n  {results / 'summary.csv'}; {drawn} charts in {figures}")
 

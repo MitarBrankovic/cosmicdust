@@ -115,11 +115,14 @@ es_drop() {
 	curl -fs -XDELETE "$ES_ADDRESS/_index_template/$1-*" >/dev/null 2>&1 || true
 }
 
-# es_lines is how many log lines of a run are searchable.
-es_lines() {
-	curl -fs "$ES_ADDRESS/$1-logs-*/_count?ignore_unavailable=true&allow_no_indices=true" 2>/dev/null |
+# es_count is how many rows of a run's table (logs, events) are searchable.
+es_count() { # <index prefix> <table>
+	curl -fs "$ES_ADDRESS/$1-$2-*/_count?ignore_unavailable=true&allow_no_indices=true" 2>/dev/null |
 		sed -n 's/.*"count":\([0-9]*\).*/\1/p'
 }
+
+# es_lines is how many log lines of a run are searchable.
+es_lines() { es_count "$1" logs; }
 
 net_up() {
 	docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
@@ -243,9 +246,10 @@ nodes_stop() {
 }
 
 # generator_args are loggen's arguments for count lines at rate lines per
-# second, of filler or - with REPLAY - of a real log's text.
+# second, of filler or - with REPLAY - of a real log's text. GENERATOR_ARGS
+# are more of them.
 generator_args() { # <id> <rate> <count>
-	echo "-id $1 -rate $2 -count $3${REPLAY:+ -replay /data/replay.log}"
+	echo "-id $1 -rate $2 -count $3${REPLAY:+ -replay /data/replay.log}${GENERATOR_ARGS:+ $GENERATOR_ARGS}"
 }
 
 # generator_mounts gives a generator the log it replays.
@@ -423,6 +427,12 @@ begin() { # <experiment> <x> <series> <round>
 # emit adds one measured value of the run in progress.
 emit() { # <metric> <value>
 	echo "$EXPERIMENT,$X,$SERIES,$ROUND,$1,$2" >>"$RUN/rows.csv"
+}
+
+# emit_as adds a value under another series: for a run that measures several
+# things side by side.
+emit_as() { # <series> <metric> <value>
+	echo "$EXPERIMENT,$X,$1,$ROUND,$2,$3" >>"$RUN/rows.csv"
 }
 
 # verified reads every generator's lines back through the query API and
