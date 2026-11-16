@@ -106,6 +106,15 @@ EXPERIMENTS = {
             "mb_received": "megabytes the server received",
         },
     },
+    "events": {
+        "axis": "what the agent did meanwhile",
+        "order": ["live", "kill9", "away"],
+        "charts": {
+            "recorded_pct": "exits of containers that were recorded (%)",
+            "final_right_pct": "containers whose last event leaves them in the right state (%)",
+            "inferred_pct": "exit events concluded from a listing (%)",
+        },
+    },
 }
 
 # The values that are not measurements but outcomes: shown as "k of n runs".

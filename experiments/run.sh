@@ -9,8 +9,8 @@
 #   experiments/run.sh -n 5 -o <directory>     continue a session that was interrupted
 #
 #   -n <rounds>       how many times every run is made (default 3)
-#   -e <experiments>  nodes, adverse, compare, ceiling, compress, latency;
-#                     comma separated (default all)
+#   -e <experiments>  nodes, adverse, compare, ceiling, compress, latency,
+#                     events; comma separated (default all)
 #   -s <scenarios>    nodes: steady, outage, churn (default all)
 #   -k <nodes>        nodes and adverse: numbers of nodes (default 1,3,5,10)
 #   -o <directory>    where the results go (default experiments/results/<time>);
@@ -32,6 +32,9 @@
 #            out when no real log is given
 #   latency  how late a line is at the server and in the search, by how fresh
 #            the agent is set to be (latency.sh; SETTINGS)
+#   events   the lifecycle events of containers against a script that knows
+#            what happened, with the agent running, killed or away meanwhile
+#            (events.sh; MODES)
 #
 # The rest is set from the environment (lib.sh, collectors.sh): CONTAINERS,
 # RATE, DURATION, NODE_CPUS, NODE_MEM, REPLAY, ES_ADDRESS, PYTHON.
@@ -54,9 +57,10 @@ quick_settings=${SETTINGS-}
 . "$EXP/collectors.sh"
 . "$EXP/compress.sh"
 . "$EXP/latency.sh"
+. "$EXP/events.sh"
 
 ROUNDS=3
-EXPERIMENTS=nodes,adverse,compare,ceiling,compress,latency
+EXPERIMENTS=nodes,adverse,compare,ceiling,compress,latency,events
 OUT=
 while getopts "n:e:s:k:o:qh" opt; do
 	case $opt in
@@ -117,6 +121,7 @@ trap 'exit 130' INT TERM
 	echo "ceiling: loads $LOADS for $LOAD_SECONDS s; the agent under $CEILING_CPUS CPU"
 	echo "compress: logs $(compress_logs | awk '{ printf "%s%s", sep, $0; sep = ", " }'); files of $FILE_SECONDS s; $COMPRESS_CONTAINERS generators x $COMPRESS_RATE lines/s"
 	echo "latency: settings $SETTINGS; $LATENCY_CONTAINERS generators x $LATENCY_RATE lines/s for $LATENCY_SECONDS s; a container fails every $LATENCY_CRASH_EVERY s"
+	echo "events: modes $MODES; the containers run $EVENTS_IMAGE"
 	echo "generators write: ${REPLAY:-filler}"
 	echo "go: $(go version | cut -d' ' -f3-)"
 	echo "docker: $(docker version --format '{{.Server.Version}}'); node image: $DIND"

@@ -23,6 +23,7 @@ the server over gRPC, through the gateway of a Docker network.
 | `ceiling` | the same with the agent alone, under growing loads | lines per second asked for | the agent |
 | `compress` | one roomy node whose agent sends nothing, and generators that write the lines of a real log | log | what kept the logs: the agent, gzip, zstd |
 | `latency` | the server and one node under a steady load, the agent set to be more or less fresh | setting | what was timed: a line to the server, a line to the search, an urgent event |
+| `events` | the server and one node on which a script plays the lifecycles of containers | what the agent does meanwhile | the agent |
 
 ### nodes
 
@@ -126,18 +127,47 @@ timed comes from the server's own record of when each file arrived and when its 
 | `urgent` | the end of the process of a container that failed | the urgent event is at the server |
 | `agent` | | what the agent cost and sent meanwhile, and whether every line came back once |
 
+### events
+
+The lifecycle events of containers, against a script that knows what happened. Every run plays the same lifecycles
+on one node, with containers of `EVENTS_IMAGE`:
+
+| Container | What happens to it | Exits that must be recorded | Left |
+|---|---|---|---|
+| `ev-ok`, `ev-fail` | end on their own, with 0 and with 3 | one each, with its code | exited |
+| `ev-stop`, `ev-kill` | `docker stop`, `docker kill` | one each, 137 | exited |
+| `ev-oom`, `ev-oom-fast` | killed by the kernel for memory, after a moment and at once | one each, 137, for memory | exited |
+| `ev-policy` | fails under a restart policy that gives up after three restarts | four, one per incarnation | exited |
+| `ev-restart` | `docker restart` | one, 137 | running |
+| `ev-pause` | paused and continued | none | running |
+| `ev-rm` | removed while it runs | one, 137 | removed |
+| `ev-ctr` | run by containerd without Docker, ends with 2 | one | exited |
+
+The events are then read through the query API and compared with that ([`cmd/events`](cmd/events/main.go)). A mode
+is what the agent does while the script plays:
+
+| Mode | The agent | What it has to go on |
+|---|---|---|
+| `live` | runs all along | the event streams of the runtimes |
+| `kill9` | is killed with `kill -9` twice and started again | the streams, and a listing for what it missed |
+| `away` | is stopped before the lifecycles and started after them | a listing alone |
+
+A listing shows what is, not what was. An exit that a later start of the same container hides, the incarnations a
+restart policy went through before the last, and anything of a container that is gone cannot be concluded from it:
+in `away`, those are missing by design, and the run says how many.
+
 ## What a run measures
 
 | Value | Experiments | |
 |---|---|---|
 | `exactly_once` | all but `compress`, for the agent | 1 if every line of every generator came back through the query API once: none missing, none twice ([`cmd/verify`](cmd/verify/main.go)); in `evict`, none missing but the ones recorded as dropped |
 | `lines_expected`, `lines_stored`, `lines_missing`, `lines_duplicate` | all but `compress` | the lines behind that; for Fluent Bit and Vector, `lines_stored` is the lines in their output file |
-| `agent_cpu_pct`, `agent_cpu_pct_max` | `nodes`, `adverse` | CPU of the agent while the generators wrote, in percent of one core: the mean of the nodes and the busiest node |
-| `agent_rss_mb`, `agent_rss_mb_max` | `nodes`, `adverse` | resident memory of the agent, the most seen: the mean of the nodes and the largest |
-| `server_cpu_pct`, `server_rss_mb` | `nodes`, `adverse` | the same for the server |
+| `agent_cpu_pct`, `agent_cpu_pct_max` | `nodes`, `adverse`, `latency` | CPU of the agent while the generators wrote, in percent of one core: the mean of the nodes and the busiest node |
+| `agent_rss_mb`, `agent_rss_mb_max` | `nodes`, `adverse`, `latency` | resident memory of the agent, the most seen: the mean of the nodes and the largest |
+| `server_cpu_pct`, `server_rss_mb` | `nodes`, `adverse`, `latency` | the same for the server |
 | `settle_s` | all but `compress`, for the agent | seconds until every line can be searched, from the end of the load (or, where the server was away, from its return) |
-| `scenario_s` | `nodes`, `adverse` | seconds from the first line to the end of the scenario's part: more than planned if a node could not write as fast as asked |
-| `urgent_expected`, `urgent_delivered` | `outage`, `narrow` | containers that failed while the server was away, and how many of them it was told about at once after its return |
+| `scenario_s` | `nodes`, `adverse`, `latency`, `events` | seconds from the first line to the end of the scenario's part: more than planned if a node could not write as fast as asked; in `events`, the seconds the lifecycles took |
+| `urgent_expected`, `urgent_delivered` | `outage`, `narrow`, `latency` | containers that failed (in `outage` and `narrow`, while the server was away), and how many of them the server was told about on the urgent way |
 | `link_mb`, `link_lost_pct` | `narrow` | what the narrow links carried to the server, and the share of the packets they lost on the way |
 | `lines_dropped`, `dropped_pct` | `evict`, `block` | lines the agents dropped for room, as they count them, and their share of the lines written |
 | `store_full_times` | `evict`, `block` | how many times an agent stopped reading because its store was full |
@@ -157,10 +187,16 @@ timed comes from the server's own record of when each file arrived and when its 
 | `p50_s`, `p95_s`, `p99_s`, `max_s` | `latency` | seconds within which half, 95 % and 99 % of the lines were there, and the latest of them; for urgent events, half and the latest |
 | `files_per_min`, `mb_received` | `latency` | files of log lines the agent sent per minute of load, and megabytes the server received in all |
 | `lines_timed`, `log_files`, `events_timed` | `latency` | the lines, the files of log lines and the urgent events behind those values |
+| `exits_expected`, `exits_recorded`, `recorded_pct` | `events` | exits the script caused, and how many of them have an exit event of their incarnation that is not older than the incarnation's start |
+| `codes_right_pct`, `oom_right_pct` | `events` | of the exits recorded, those with the right exit code, and those that say rightly whether the kernel killed for memory |
+| `duplicates` | `events` | exits a runtime reported, or the agent concluded, more than once |
+| `exit_events`, `inferred_pct` | `events` | exit events in all (Docker and containerd each report an exit), and the share of them the agent concluded from a listing |
+| `containers`, `final_right_pct` | `events` | containers of the script, and the share whose last event leaves them in the state they are in |
 | `machine_busy_cores` | all | cores of the whole machine that were busy during the run: a run made while something else was busy is not worth keeping |
+| `clock_set_s` | all | seconds the machine's wall clock was set by during the run, against its uptime: the times of lines and events are wall clock times, so across a step of it some are out of order and what was timed is off by as much |
 
-In `nodes` the agents and the server are measured by what they report themselves (`process_cpu_seconds_total`,
-`process_resident_memory_bytes`), sampled every two seconds.
+In `nodes`, `adverse` and `latency` the agents and the server are measured by what they report themselves
+(`process_cpu_seconds_total`, `process_resident_memory_bytes`), sampled every two seconds.
 
 ## Results
 
@@ -200,6 +236,8 @@ makes the summary and the charts again.
 | `SETTINGS` | `s1 s2 default s30 s60` | `latency`: the settings, space separated |
 | `LATENCY_CONTAINERS`, `LATENCY_RATE`, `LATENCY_SECONDS` | `10`, `100`, `180` | `latency`: generators, lines per second of each, seconds of load |
 | `LATENCY_CRASH_EVERY` | `15` | `latency`: seconds between two containers that fail |
+| `MODES` | `live kill9 away` | `events`: the modes, space separated |
+| `EVENTS_IMAGE` | `alpine:3` | `events`: the image of the script's containers; anything with a shell, `sleep` and `dd` |
 | `REPLAY` | | a log file whose lines the generators write instead of filler, for text that compresses like real logs do |
 | `ES_ADDRESS` | | an Elasticsearch to use; without it one is started in a container, on `ES_PORT` (`19200`) |
 | `PYTHON` | `python3` | a Python with matplotlib, for the charts |

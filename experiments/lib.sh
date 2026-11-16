@@ -72,6 +72,7 @@ build() {
 		go build -o "$BIN/cosmicdust-server" ./cmd/server &&
 		go build -o "$BIN/verify" ./experiments/cmd/verify &&
 		go build -o "$BIN/latency" ./experiments/cmd/latency &&
+		go build -o "$BIN/events" ./experiments/cmd/events &&
 		CGO_ENABLED=0 go build -o "$ctx/cosmicdust-agent" ./cmd/agent &&
 		CGO_ENABLED=0 go build -o "$ctx/loggen" ./experiments/cmd/loggen) || die "build failed"
 	cp "$EXP/node/entrypoint.sh" "$ctx/entrypoint.sh"
@@ -362,6 +363,12 @@ busy_cores() { # <machine before> <machine after>
 	echo "$1 $2" | awk -v n="$(nproc)" '{ d = $4 - $2; printf "%.2f\n", (d > 0 ? n * ($3 - $1) / d : 0) }'
 }
 
+# clock_offset is the machine's wall clock against the one that only runs
+# forward (its uptime). Two of them say whether the wall clock was set in
+# between. The times of lines and events are wall clock times: across a step
+# of it some of them are out of order, and what was timed is off by the step.
+clock_offset() { awk -v now="$(date +%s.%N)" '{ printf "%.2f\n", now - $1 }' /proc/uptime; }
+
 # wait_indexed waits until a run's lines are all searchable and prints how
 # long that took; it fails once INDEX_TIMEOUT has passed. Where the agents may
 # drop lines for room (MAY_DROP is the number of nodes), a line an agent says
@@ -424,6 +431,7 @@ begin() { # <experiment> <x> <series> <round>
 	mkdir -p "$RUN"
 	teardown
 	es_drop "$PREFIX"
+	CLOCK=$(clock_offset)
 }
 
 # emit adds one measured value of the run in progress.
@@ -471,8 +479,10 @@ verified() { # <generators per node> <lines per generator> <node>...
 	return 1
 }
 
-# finish stops everything and hands the run's values to the session.
+# finish stops everything and hands the run's values to the session, with
+# the seconds the wall clock was set by since the run began.
 finish() {
+	emit clock_set_s "$(awk -v a="$CLOCK" -v b="$(clock_offset)" 'BEGIN { d = b - a; printf "%.2f", (d < 0 ? -d : d) }')"
 	teardown
 	es_drop "$PREFIX"
 	cat "$RUN/rows.csv" >>"$OUT/runs.csv"
