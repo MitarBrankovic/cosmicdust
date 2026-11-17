@@ -374,6 +374,113 @@ func TestCompaction(t *testing.T) {
 	}
 }
 
+// The files of one merge: small, next to each other, oldest first, bounded in
+// number and in raw size.
+func TestCompactionGroup(t *testing.T) {
+	o := CompactOptions{GroupFiles: 5, GroupBytes: 100} // small is up to 25
+	type file struct {
+		segment uint64
+		raw     int64
+	}
+	for _, tc := range []struct {
+		name  string
+		files []file
+		want  []uint64
+	}{
+		{"no more than GroupFiles", []file{{1, 10}, {2, 10}, {3, 10}, {4, 10}, {5, 10}, {6, 10}}, []uint64{1, 2, 3, 4, 5}},
+		{"no more than GroupBytes", []file{{1, 25}, {2, 25}, {3, 25}, {4, 25}, {5, 25}}, []uint64{1, 2, 3, 4}},
+		{"a large file is left", []file{{1, 26}, {2, 10}, {3, 10}}, []uint64{2, 3}},
+		{"a large file ends the run", []file{{1, 10}, {2, 26}, {3, 10}, {4, 10}}, []uint64{3, 4}},
+		{"only files next to each other", []file{{1, 10}, {2, 26}, {3, 10}}, nil},
+		{"oldest first", []file{{3, 10}, {1, 10}, {2, 10}}, []uint64{1, 2, 3}},
+		{"one file", []file{{1, 10}}, nil},
+		{"none", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var files []manifestFile
+			for _, f := range tc.files {
+				files = append(files, manifestFile{Segments: [2]uint64{f.segment, f.segment}, BytesRaw: f.raw})
+			}
+			var got []uint64
+			for _, f := range o.group(files) {
+				got = append(got, f.Segments[0])
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("group %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// An hour of an outage is merged a bounded group at a time, a few groups a
+// look, and a merged file that is large enough is not merged again: the
+// memory and the time of a merge do not grow with the hour.
+func TestCompactionInGroups(t *testing.T) {
+	var groupBytes int64
+	e := newEnv(t, func(o *Options) { o.Compact.GroupFiles, o.Compact.GroupBytes = 2, groupBytes })
+	compactable(t, e, 12)
+	want := e.logLines()
+	slices.Sort(want)
+	dir := must(e.s.partitionDirs(tableLogs))[0]
+	var largest int64
+	for _, f := range must(loadManifest(dir)).Files {
+		largest = max(largest, f.BytesRaw)
+	}
+	groupBytes = largest*4 + largest/2 // every file is small, two of them merged are not
+	e.reopen()
+
+	// 12 files, two a merge: four merges in the first look, two in the
+	// second, nothing left to merge in the third.
+	for look, left := range []int{8, 6, 6} {
+		if err := e.s.compactAll(time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if n := len(must(loadManifest(dir)).Files); n != left {
+			t.Fatalf("look %d: %d files, want %d", look+1, n, left)
+		}
+	}
+	for _, f := range must(loadManifest(dir)).Files {
+		if !strings.HasPrefix(f.Name, "compact-") || f.Rows != 8 {
+			t.Fatalf("after compaction: %s with %d rows, want two files of 4 rows merged", f.Name, f.Rows)
+		}
+		rows := must(parquet.ReadFile[LogRow](filepath.Join(dir, f.Name)))
+		for i := 1; i < len(rows); i++ {
+			a, b := rows[i-1], rows[i]
+			if a.ContainerID > b.ContainerID || (a.ContainerID == b.ContainerID && a.TS.After(b.TS)) {
+				t.Fatalf("%s: row %d out of order", f.Name, i)
+			}
+		}
+	}
+	got := e.logLines()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("%d rows after, %d before", len(got), len(want))
+	}
+	if entries := must(os.ReadDir(dir)); len(entries) != 7 { // six files and the manifest
+		t.Fatalf("files left in the partition: %d", len(entries))
+	}
+}
+
+// Past MaxFiles an hour is merged without waiting for its end.
+func TestCompactionPastMaxFiles(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.Compact.MaxFiles = 4 })
+	compactable(t, e, 5)
+	want := e.logLines()
+	slices.Sort(want)
+	if err := e.s.compactAll(hour0.Add(30 * time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	dir := must(e.s.partitionDirs(tableLogs))[0]
+	if files := must(loadManifest(dir)).Files; len(files) != 1 {
+		t.Fatalf("an hour past MaxFiles was left with %d files", len(files))
+	}
+	got := e.logLines()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("%d rows after, %d before", len(got), len(want))
+	}
+}
+
 func TestCompactionLeavesTheCurrentHourAndSyncedFiles(t *testing.T) {
 	e := newEnv(t)
 	compactable(t, e, 3)

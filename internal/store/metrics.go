@@ -39,7 +39,7 @@ func newMetrics(s *Store) (*metrics, []prometheus.Collector) {
 			Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30}}),
 		rowsStored: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "cosmicdust_agent", Subsystem: "store",
 			Name: "rows_total", Help: "Rows written to Parquet by conversions, by table."}, []string{"table"}),
-		compactions:    c("compactions_total", "Partitions compacted."),
+		compactions:    c("compactions_total", "Merges of small unsynced files into one."),
 		compactSkipped: c("compactions_skipped_total", "Compactions put off for lack of room for a second copy."),
 		bytesCompacted: c("compacted_bytes_total", "Parquet bytes written by compaction."),
 		orphans:        c("orphans_removed_total", "Files a crash left between writing and committing, removed at start."),
