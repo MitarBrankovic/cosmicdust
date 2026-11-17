@@ -36,8 +36,10 @@ what happens meanwhile:
 | `steady` | nothing: the cost of the system under a steady load |
 | `outage` | the server is away from a quarter of the load until five seconds after its end; meanwhile containers fail on every node |
 | `churn` | every `KILL_EVERY` seconds the agent of one node is killed with `kill -9` and started again, node after node |
-| `containerd` | every `KILL_EVERY` seconds the containerd of one node is killed; its Docker starts it again and the containers run on, while the agent loses its stream of containerd's events again and again |
 | `dockerd` | in the middle of the load the Docker of every node is stopped and started again. Its containers end with it, so the lines that must be there are the ones their log files hold (`lines_written`), not the ones asked for |
+| `dockerkill` | the same, with Docker killed with `kill -9` instead of stopped. The containers write on into their pipes until the new daemon finds them, takes what they wrote and ends them |
+
+In a node the containerd runs inside the Docker daemon and goes with it: there is no restarting it alone.
 
 A long outage is `outage` with a long load: the server is away from `OUTAGE_AFTER` seconds into the load (a quarter
 of it, unless set) until five seconds after its end, so `OUTAGE_AFTER=60 DURATION=3655` keeps it away for an hour.
@@ -200,8 +202,8 @@ in `away`, those are missing by design, and the run says how many.
 | `duplicates` | `events` | exits a runtime reported, or the agent concluded, more than once |
 | `exit_events`, `inferred_pct` | `events` | exit events in all (Docker and containerd each report an exit), and the share of them the agent concluded from a listing |
 | `containers`, `final_right_pct` | `events` | containers of the script, and the share whose last event leaves them in the state they are in |
-| `agent_kills`, `runtime_kills`, `runtime_restarts` | `churn`, `containerd`, `dockerd` | how many times an agent or a containerd was killed, and how many Docker daemons were restarted |
-| `lines_written` | `dockerd` | lines in the log files of the generators, which ended when their Docker was stopped: the run is right when exactly those came back once |
+| `agent_kills`, `runtime_restarts` | `churn`, `dockerd`, `dockerkill` | how many times an agent was killed, and how many Docker daemons were stopped or killed and started again |
+| `lines_written` | `dockerd`, `dockerkill` | lines in the log files of the generators, which ended with their Docker: the run is right when exactly those came back once |
 | `machine_busy_cores` | all | cores of the whole machine that were busy during the run: a run made while something else was busy is not worth keeping |
 | `clock_set_s` | all | seconds the machine's wall clock was set by during the run, against its uptime: the times of lines and events are wall clock times, so across a step of it some are out of order and what was timed is off by as much |
 
@@ -235,7 +237,7 @@ outcome is not a matter of timing.
 |---|---|---|
 | `CONTAINERS`, `RATE`, `DURATION` | `5`, `100`, `60` | `nodes`, `adverse`: generators on every node, lines per second of each, seconds of load |
 | `NODE_CPUS`, `NODE_MEM` | `1`, `512m` | `nodes`, `adverse`: what a node may use |
-| `KILL_EVERY`, `CRASHES` | `10`, `5` | `churn`, `containerd`: seconds between two kills; `outage`: containers that fail on every node |
+| `KILL_EVERY`, `CRASHES` | `10`, `5` | `churn`: seconds between two kills; `outage`: containers that fail on every node |
 | `OUTAGE_AFTER` | a quarter of `DURATION` | `outage`, `narrow`: seconds of load before the server goes away |
 | `TRANSPORT` | `grpc` | how the nodes send: `grpc`, or `nats` through a `nats-server` started with the server, on `NATS_PORT` (`14222`) |
 | `NODES_NAME` | `cosmicdust-node` | what the nodes' containers are named after; with the ports, what a second session on the same machine sets apart |

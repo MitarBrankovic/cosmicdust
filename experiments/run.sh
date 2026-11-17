@@ -11,7 +11,7 @@
 #   -n <rounds>       how many times every run is made (default 3)
 #   -e <experiments>  nodes, adverse, compare, ceiling, compress, latency,
 #                     events; comma separated (default all)
-#   -s <scenarios>    nodes: steady, outage, churn, containerd, dockerd
+#   -s <scenarios>    nodes: steady, outage, churn, dockerd, dockerkill
 #                     (default all)
 #   -k <nodes>        nodes and adverse: numbers of nodes (default 1,3,5,10)
 #   -o <directory>    where the results go (default experiments/results/<time>);
@@ -21,8 +21,8 @@
 # The experiments:
 #
 #   nodes    the whole system with 1 to 10 nodes: steady load, the server
-#            away, agents killed, containerd killed, Docker restarted
-#            (nodes.sh)
+#            away, agents killed, Docker stopped or killed and started
+#            again (nodes.sh)
 #   adverse  the same system where things are hard for a node: a narrow link
 #            that loses packets, a burst of lines, a full store (nodes.sh;
 #            ADVERSE, LINK_MBIT, LINK_RTT, LINK_LOSS, BURST_X, STORE_QUOTA)
