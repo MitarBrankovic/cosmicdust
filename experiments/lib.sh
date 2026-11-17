@@ -37,6 +37,23 @@ fi
 : "${DIND:=docker:29-dind}"
 : "${PYTHON:=python3}"
 
+# How the nodes send to the server: over gRPC, or through a NATS server that
+# is then a part of "the server" - it is started and stopped with it.
+: "${TRANSPORT:=grpc}" "${NATS_PORT:=14222}"
+case $TRANSPORT in
+grpc) SYNC_PORT=$GRPC_PORT ;;
+nats) SYNC_PORT=$NATS_PORT ;;
+*)
+	echo "TRANSPORT is grpc or nats, not '$TRANSPORT'" >&2
+	exit 2
+	;;
+esac
+
+# The containers of the nodes are named after this. A second session on the
+# same machine takes another name, and other ports (GRPC_PORT, HTTP_PORT,
+# NATS_PORT, NODE_PORT_BASE): each then stops only its own nodes.
+: "${NODES_NAME:=cosmicdust-node}"
+
 NET=cosmicdust-exp
 ES_NAME=cosmicdust-exp-es
 NODE_IMAGE=cosmicdust-node:exp
@@ -57,6 +74,7 @@ need() {
 	"$PYTHON" -c 'import matplotlib' 2>/dev/null || die "$PYTHON has no matplotlib (set PYTHON to one that has)"
 	docker info >/dev/null 2>&1 || die "cannot reach the Docker daemon"
 	[ -z "$REPLAY" ] || [ -r "$REPLAY" ] || die "cannot read REPLAY=$REPLAY"
+	[ "$TRANSPORT" != nats ] || command -v nats-server >/dev/null || die "nats-server is not installed (TRANSPORT=nats)"
 }
 
 # build makes everything a run needs: the server and the tools that check a
@@ -134,13 +152,23 @@ net_up() {
 }
 
 # server_start runs the server over a run's directory, indexing under prefix.
-# Started again over the same directory it continues where it stopped.
+# Started again over the same directory it continues where it stopped. With
+# TRANSPORT=nats the NATS server the nodes send through comes up first.
 server_start() { # <run directory> <index prefix>
-	DATA_DIR="$1/server" GRPC_ADDRESS="0.0.0.0:$GRPC_PORT" HTTP_ADDRESS="127.0.0.1:$HTTP_PORT" \
+	local i nats=
+	if [ "$TRANSPORT" = nats ]; then
+		nats-server -a 0.0.0.0 -p "$NATS_PORT" >>"$1/nats.log" 2>&1 &
+		NATS_PID=$!
+		nats=nats://127.0.0.1:$NATS_PORT
+		for i in $(seq 1 50); do
+			(exec 3<>"/dev/tcp/127.0.0.1/$NATS_PORT") 2>/dev/null && break
+			sleep 0.1
+		done
+	fi
+	DATA_DIR="$1/server" GRPC_ADDRESS="0.0.0.0:$GRPC_PORT" HTTP_ADDRESS="127.0.0.1:$HTTP_PORT" NATS_ADDRESS="$nats" \
 		ES_ADDRESS="$ES_ADDRESS" ES_INDEX_PREFIX="$2" ES_REPLICAS=0 COMPACT_EVERY=0 \
 		"$BIN/cosmicdust-server" >>"$1/server.log" 2>&1 &
 	SERVER_PID=$!
-	local i
 	for i in $(seq 1 50); do
 		curl -fs "http://127.0.0.1:$HTTP_PORT/healthz" >/dev/null 2>&1 && return
 		sleep 0.2
@@ -149,13 +177,22 @@ server_start() { # <run directory> <index prefix>
 }
 
 server_stop() { # [signal]
-	[ -n "${SERVER_PID:-}" ] || return 0
-	kill "-${1:-TERM}" "$SERVER_PID" 2>/dev/null || true
-	wait "$SERVER_PID" 2>/dev/null || true
-	SERVER_PID=
+	if [ -n "${SERVER_PID:-}" ]; then
+		kill "-${1:-TERM}" "$SERVER_PID" 2>/dev/null || true
+		wait "$SERVER_PID" 2>/dev/null || true
+		SERVER_PID=
+	fi
+	if [ -n "${NATS_PID:-}" ]; then
+		kill "$NATS_PID" 2>/dev/null || true
+		wait "$NATS_PID" 2>/dev/null || true
+		NATS_PID=
+	fi
 }
 
-node_name() { echo "cosmicdust-node-$1"; }
+# sync_url is where a node sends.
+sync_url() { echo "$TRANSPORT://$GATEWAY:$SYNC_PORT"; }
+
+node_name() { echo "$NODES_NAME-$1"; }
 node_exec() { # <node> <command...>
 	local i=$1
 	shift
@@ -172,7 +209,7 @@ node_run() { # <node> <docker run arguments...>
 	fi
 	docker run -d --privileged --name "$(node_name "$i")" --hostname "node-$i" --network "$NET" \
 		-p "127.0.0.1:$((NODE_PORT_BASE + i)):9101" "${replay[@]}" \
-		-e COSMICDUST_NODE="node-$i" -e COSMICDUST_SYNC_URL="grpc://$GATEWAY:$GRPC_PORT" \
+		-e COSMICDUST_NODE="node-$i" -e COSMICDUST_SYNC_URL="$(sync_url)" \
 		"$@" "$NODE_IMAGE" >/dev/null || die "cannot start node $i"
 }
 
@@ -224,28 +261,35 @@ link_shape() { # <node>
 		tc qdisc add dev eth0 root handle 1: prio bands 3 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 		tc qdisc add dev eth0 parent 1:3 handle 30: $netem
 		tc filter add dev eth0 parent 1: protocol ip u32 \
-			match ip protocol 6 0xff match ip dport $GRPC_PORT 0xffff flowid 1:3
+			match ip protocol 6 0xff match ip dport $SYNC_PORT 0xffff flowid 1:3
 		tc qdisc add dev ifb0 root handle 30: $netem
 		tc qdisc add dev eth0 handle ffff: ingress
 		tc filter add dev eth0 parent ffff: protocol ip u32 \
-			match ip protocol 6 0xff match ip sport $GRPC_PORT 0xffff action mirred egress redirect dev ifb0
+			match ip protocol 6 0xff match ip sport $SYNC_PORT 0xffff action mirred egress redirect dev ifb0
 	" || die "cannot shape the link of node $1"
 }
 
-# link_stats prints what the links of k nodes carried to the server and what
-# they lost on the way: "<megabytes> <percent of the packets>".
+# link_stats prints what the links of k nodes carried to the server and the
+# share of the packets they lost: "<megabytes> <percent>". The megabytes are
+# counted on the way to the server, the losses on the way back. On the way
+# out TCP hands the queue several segments as one packet whatever the
+# device's offloads say - they are cut apart after the queue - so a loss
+# there takes all of them and is counted once, against segments that are
+# counted one by one: with 5 % asked for, that counter reads 3. What comes in
+# is one segment a packet.
 link_stats() { # <k>
 	local i
 	for i in $(seq 1 "$1"); do
-		node_exec "$i" tc -s qdisc show dev eth0
+		node_exec "$i" tc -s qdisc show dev eth0 | sed 's/^/out /'
+		node_exec "$i" tc -s qdisc show dev ifb0 | sed 's/^/in /'
 	done | awk '
-		/^qdisc/ { netem = ($2 == "netem") }
-		netem && $1 == "Sent" { bytes += $2; sent += $4; lost += $7 }
+		$2 == "qdisc" { netem = ($3 == "netem") }
+		netem && $2 == "Sent" { if ($1 == "out") bytes += $3; else { sent += $5; lost += $8 } }
 		END { printf "%.2f %.2f\n", bytes / 1e6, (sent + lost > 0 ? 100 * lost / (sent + lost) : 0) }'
 }
 
 nodes_stop() {
-	docker ps -aq --filter "name=^cosmicdust-node-" | xargs -r docker rm -fv >/dev/null 2>&1 || true
+	docker ps -aq --filter "name=^$NODES_NAME-" | xargs -r docker rm -fv >/dev/null 2>&1 || true
 }
 
 # generator_args are loggen's arguments for count lines at rate lines per

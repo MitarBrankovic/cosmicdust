@@ -11,7 +11,8 @@
 #   -n <rounds>       how many times every run is made (default 3)
 #   -e <experiments>  nodes, adverse, compare, ceiling, compress, latency,
 #                     events; comma separated (default all)
-#   -s <scenarios>    nodes: steady, outage, churn (default all)
+#   -s <scenarios>    nodes: steady, outage, churn, containerd, dockerd
+#                     (default all)
 #   -k <nodes>        nodes and adverse: numbers of nodes (default 1,3,5,10)
 #   -o <directory>    where the results go (default experiments/results/<time>);
 #                     runs already there are not repeated
@@ -20,7 +21,8 @@
 # The experiments:
 #
 #   nodes    the whole system with 1 to 10 nodes: steady load, the server
-#            away, agents killed (nodes.sh)
+#            away, agents killed, containerd killed, Docker restarted
+#            (nodes.sh)
 #   adverse  the same system where things are hard for a node: a narrow link
 #            that loses packets, a burst of lines, a full store (nodes.sh;
 #            ADVERSE, LINK_MBIT, LINK_RTT, LINK_LOSS, BURST_X, STORE_QUOTA)
@@ -37,7 +39,7 @@
 #            (events.sh; MODES)
 #
 # The rest is set from the environment (lib.sh, collectors.sh): CONTAINERS,
-# RATE, DURATION, NODE_CPUS, NODE_MEM, REPLAY, ES_ADDRESS, PYTHON.
+# RATE, DURATION, NODE_CPUS, NODE_MEM, REPLAY, TRANSPORT, ES_ADDRESS, PYTHON.
 #
 # In every round each run is made once, and each round starts one place
 # further down the list, so that no run always follows the same one. The
@@ -115,6 +117,7 @@ trap 'exit 130' INT TERM
 	echo "date: $(date -Is)"
 	echo "commit: $(git -C "$REPO" describe --always --dirty 2>/dev/null)"
 	echo "rounds: $ROUNDS; experiments: $EXPERIMENTS"
+	echo "transport: $TRANSPORT$([ "$TRANSPORT" != nats ] || nats-server --version | sed 's/^/, /')"
 	echo "nodes: scenarios $SCENARIOS; sizes $NODES; per node $CONTAINERS generators x $RATE lines/s for $DURATION s; $NODE_CPUS CPU, $NODE_MEM"
 	echo "adverse: scenarios $ADVERSE; link $LINK_MBIT Mbit/s, round trip $LINK_RTT ms, loss $LINK_LOSS %; burst x$BURST_X; store quota $STORE_QUOTA"
 	echo "compare: cases $CASES; collectors $SUBJECTS ($FLUENT_BIT_IMAGE, $VECTOR_IMAGE)"

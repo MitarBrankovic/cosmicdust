@@ -11,7 +11,8 @@ experiments/run.sh -q                # a quick pass, to see that everything work
 One machine plays the whole system. The server runs as a process on the host and indexes into an Elasticsearch in a
 container. Every node is a container with a Docker daemon and a containerd of its own ([`node/`](node/Dockerfile)), in
 which the agent and the log generators run, so each node has its own runtime, cgroups and network. The nodes send to
-the server over gRPC, through the gateway of a Docker network.
+the server over gRPC, through the gateway of a Docker network; with `TRANSPORT=nats` they send through a NATS server
+instead, which then counts as a part of the server and is away when the server is.
 
 ## The experiments
 
@@ -35,6 +36,13 @@ what happens meanwhile:
 | `steady` | nothing: the cost of the system under a steady load |
 | `outage` | the server is away from a quarter of the load until five seconds after its end; meanwhile containers fail on every node |
 | `churn` | every `KILL_EVERY` seconds the agent of one node is killed with `kill -9` and started again, node after node |
+| `containerd` | every `KILL_EVERY` seconds the containerd of one node is killed; its Docker starts it again and the containers run on, while the agent loses its stream of containerd's events again and again |
+| `dockerd` | in the middle of the load the Docker of every node is stopped and started again. Its containers end with it, so the lines that must be there are the ones their log files hold (`lines_written`), not the ones asked for |
+
+A long outage is `outage` with a long load: the server is away from `OUTAGE_AFTER` seconds into the load (a quarter
+of it, unless set) until five seconds after its end, so `OUTAGE_AFTER=60 DURATION=3655` keeps it away for an hour.
+Containers that fail early in so long an outage are no longer told on the urgent way when the server returns - the
+agent keeps an urgent event for ten minutes - but they are in the events it sends with everything else.
 
 ### adverse
 
@@ -168,7 +176,7 @@ in `away`, those are missing by design, and the run says how many.
 | `settle_s` | all but `compress`, for the agent | seconds until every line can be searched, from the end of the load (or, where the server was away, from its return) |
 | `scenario_s` | `nodes`, `adverse`, `latency`, `events` | seconds from the first line to the end of the scenario's part: more than planned if a node could not write as fast as asked; in `events`, the seconds the lifecycles took |
 | `urgent_expected`, `urgent_delivered` | `outage`, `narrow`, `latency` | containers that failed (in `outage` and `narrow`, while the server was away), and how many of them the server was told about on the urgent way |
-| `link_mb`, `link_lost_pct` | `narrow` | what the narrow links carried to the server, and the share of the packets they lost on the way |
+| `link_mb`, `link_lost_pct` | `narrow` | what the narrow links carried to the server, and the share of the packets they lost, counted on what comes back from it: on the way out the queue is handed several segments as one packet and counts the loss of all of them once |
 | `lines_dropped`, `dropped_pct` | `evict`, `block` | lines the agents dropped for room, as they count them, and their share of the lines written |
 | `store_full_times` | `evict`, `block` | how many times an agent stopped reading because its store was full |
 | `collector_cpu_pct` | `compare`, `ceiling` | CPU of the collector while the generators wrote (with quiet containers: for the length of the case), in percent of one core |
@@ -192,6 +200,8 @@ in `away`, those are missing by design, and the run says how many.
 | `duplicates` | `events` | exits a runtime reported, or the agent concluded, more than once |
 | `exit_events`, `inferred_pct` | `events` | exit events in all (Docker and containerd each report an exit), and the share of them the agent concluded from a listing |
 | `containers`, `final_right_pct` | `events` | containers of the script, and the share whose last event leaves them in the state they are in |
+| `agent_kills`, `runtime_kills`, `runtime_restarts` | `churn`, `containerd`, `dockerd` | how many times an agent or a containerd was killed, and how many Docker daemons were restarted |
+| `lines_written` | `dockerd` | lines in the log files of the generators, which ended when their Docker was stopped: the run is right when exactly those came back once |
 | `machine_busy_cores` | all | cores of the whole machine that were busy during the run: a run made while something else was busy is not worth keeping |
 | `clock_set_s` | all | seconds the machine's wall clock was set by during the run, against its uptime: the times of lines and events are wall clock times, so across a step of it some are out of order and what was timed is off by as much |
 
@@ -215,13 +225,20 @@ In every round each run is made once, and each round starts one place further do
 interrupted continues with `-o <its directory>`: runs that are complete are not repeated. `analyze.py <directory>`
 makes the summary and the charts again.
 
+Two sessions can run side by side on one machine if the second has its own `NODES_NAME`, `GRPC_PORT`, `HTTP_PORT`,
+`NATS_PORT` and `NODE_PORT_BASE`; they share the Elasticsearch and the machine's cores, so only for runs whose
+outcome is not a matter of timing.
+
 ## Settings
 
 | Variable | Default | |
 |---|---|---|
 | `CONTAINERS`, `RATE`, `DURATION` | `5`, `100`, `60` | `nodes`, `adverse`: generators on every node, lines per second of each, seconds of load |
 | `NODE_CPUS`, `NODE_MEM` | `1`, `512m` | `nodes`, `adverse`: what a node may use |
-| `KILL_EVERY`, `CRASHES` | `10`, `5` | `churn`: seconds between two kills; `outage`: containers that fail on every node |
+| `KILL_EVERY`, `CRASHES` | `10`, `5` | `churn`, `containerd`: seconds between two kills; `outage`: containers that fail on every node |
+| `OUTAGE_AFTER` | a quarter of `DURATION` | `outage`, `narrow`: seconds of load before the server goes away |
+| `TRANSPORT` | `grpc` | how the nodes send: `grpc`, or `nats` through a `nats-server` started with the server, on `NATS_PORT` (`14222`) |
+| `NODES_NAME` | `cosmicdust-node` | what the nodes' containers are named after; with the ports, what a second session on the same machine sets apart |
 | `ADVERSE` | `narrow,burst,evict,block` | `adverse`: the scenarios |
 | `LINK_MBIT`, `LINK_RTT`, `LINK_LOSS` | `1`, `100`, `5` | `narrow`: the link's megabits per second, round trip in milliseconds, and percent of the packets lost |
 | `BURST_X` | `5` | `burst`: how many times the load |
@@ -245,6 +262,6 @@ makes the summary and the charts again.
 ## What it needs
 
 Docker that can run privileged containers (the nodes are Docker in Docker), Go, curl, and Python 3 with matplotlib;
-`zstdcat` to count Vector's output; `gzip` and `zstd` for `compress`; for `narrow`, a kernel with netem and ifb. About 2 GB of memory for
+`zstdcat` to count Vector's output; `gzip` and `zstd` for `compress`; `nats-server` for `TRANSPORT=nats`; for `narrow`, a kernel with netem and ifb. About 2 GB of memory for
 Elasticsearch, `NODE_MEM` for every node of `nodes` and `adverse`, and 4 GB for the node of `compare` and `ceiling`. For numbers worth keeping, a machine that does nothing else: the nodes,
 the server and Elasticsearch share its cores.

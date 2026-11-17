@@ -15,6 +15,11 @@
 #            meanwhile; it returns once the load is over
 #   churn    every few seconds the agent of one node is killed (kill -9) and
 #            started again, node after node
+#   containerd  every few seconds the containerd of one node is killed; its
+#            Docker starts it again, and the containers run on meanwhile
+#   dockerd  in the middle of the load the Docker of every node is stopped
+#            and started again: its containers end with it, and the lines to
+#            be there are the ones their log files hold
 #
 # adverse - what a node at the edge has to live with:
 #
@@ -27,7 +32,7 @@
 #   block    the same, with the agent told to stop reading instead: once the
 #            server is back, every line must be there
 
-: "${SCENARIOS:=steady,outage,churn}"
+: "${SCENARIOS:=steady,outage,churn,containerd,dockerd}"
 : "${ADVERSE:=narrow,burst,evict,block}"
 : "${NODES:=1,3,5,10}"
 
@@ -60,14 +65,16 @@ during_steady() {
 	sleep "$DURATION"
 }
 
+# The server goes away OUTAGE_AFTER seconds into the load - a quarter of it,
+# unless set: a long outage does not need a long load before it.
 during_outage() {
-	local crashes=${CRASHES:-5} away i j gap pids
-	sleep $((DURATION / 4))
+	local crashes=${CRASHES:-5} after=${OUTAGE_AFTER:-$((DURATION / 4))} away i j gap pids
+	sleep "$after"
 	server_stop
 	away=$(date +%s.%N)
 	# Back five seconds after the last line is written, so that what follows
 	# is the nodes catching up and nothing else.
-	gap=$(((DURATION - DURATION / 4 + 5) / crashes))
+	gap=$(((DURATION - after + 5) / crashes))
 	for j in $(seq 1 "$crashes"); do
 		pids=()
 		for i in $(seq 1 "$K"); do
@@ -105,6 +112,55 @@ during_churn() {
 	done
 	sleep $((DURATION - t))
 	emit agent_kills "$kills"
+}
+
+# The containerd of a node is the child of its Docker, which starts it again
+# when it dies. The containers are held by their shims and write on; what the
+# agent loses is its stream of containerd's events, again and again.
+during_containerd() {
+	local every=${KILL_EVERY:-10} t=0 kills=0
+	while [ $((t + every)) -le "$DURATION" ]; do
+		sleep "$every"
+		t=$((t + every))
+		node_exec $((kills % K + 1)) pkill -9 -x containerd || true
+		kills=$((kills + 1))
+	done
+	sleep $((DURATION - t))
+	emit runtime_kills "$kills"
+}
+
+# Docker is stopped the way a service is, which stops its containers: the
+# generators end where they are. What they wrote is in their log files, and
+# those lines - not the ones asked for - are the ones to be there once the
+# daemon is back.
+during_dockerd() {
+	local i n written=0 pids=()
+	sleep $((DURATION / 2))
+	for i in $(seq 1 "$K"); do
+		node_exec "$i" pkill -TERM -x dockerd &
+		pids+=($!)
+	done
+	wait "${pids[@]}" || true
+	for i in $(seq 1 "$K"); do
+		for n in $(seq 1 150); do
+			node_exec "$i" pgrep -x dockerd >/dev/null || break
+			sleep 0.2
+		done
+		docker exec -d "$(node_name "$i")" sh -c 'dockerd-entrypoint.sh dockerd >>/var/log/dockerd.log 2>&1'
+	done
+	for i in $(seq 1 "$K"); do
+		for n in $(seq 1 150); do
+			node_exec "$i" docker info >/dev/null 2>&1 && break
+			sleep 0.2
+		done
+		n=$(node_exec "$i" sh -c 'cat /var/lib/docker/containers/*/*-json.log | wc -l')
+		written=$((written + n))
+	done
+	emit lines_written "$written"
+	emit runtime_restarts "$K"
+	# Less than asked for, by the lines that were never written.
+	EXTRA=$((written - K * CONTAINERS * RATE * DURATION))
+	MAY_MISS=$((-EXTRA))
 }
 
 before_narrow() {
