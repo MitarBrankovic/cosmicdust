@@ -14,9 +14,10 @@ import (
 
 // Compaction answers the small-files problem the Spark world knows: a
 // conversion every few seconds leaves hundreds of small files per hour, each
-// with its own dictionaries and footer; they compress ~30 % worse and cost
-// more to list and to sync. Once an hour is over (or has too many
-// files), its unsynced files are merged into one.
+// with its own dictionaries and footer, and each one more to list and to
+// sync. They pile up only while nothing is synced; once such an hour is over
+// (or has too many files), its small unsynced files are merged into larger
+// ones.
 //
 // Only unsynced files are merged: merging a synced file with an unsynced one
 // leaves a file that is neither - marking it synced loses rows, marking it
@@ -25,19 +26,36 @@ import (
 // with its answer lost to a crash.
 //
 // Every converted file is sorted by container and time, so the merge reads
-// the files side by side and writes one sorted file, a few hundred rows of
-// each in memory: a first version read the whole hour and sorted it,
-// 1.7 GB for one hour.
+// the files side by side and writes one sorted file. Side by side is not
+// free: the reader of a file holds its pages decoded, which for a file of a
+// few pages is the whole file, about the raw size of its rows. A first
+// version read the whole hour and sorted it, 1.7 GB for one hour; a second
+// merged all the files of the hour at once, and after an outage, with a
+// hundred files and more, that took several times the memory the agent is
+// given and minutes of a core spent collecting garbage. So one merge takes a
+// group of files next to each other, bounded in number and in raw size. A
+// look at a partition does a few merges and leaves the rest for the next
+// look: the conversion, which shares the goroutine, never waits long.
+//
+// Only small files are worth it. Merged, files of a few hundred rows come
+// out a fifth smaller and more, their dictionaries and footers written once;
+// a file that fills its pages gains nothing, and may even grow, its similar
+// lines moved further apart. A file past a quarter of the group's size is
+// left as it is, which also keeps a merged file from being merged over and
+// over.
 //
 // The manifest is the commit point: the merged file is written first, the
 // manifest swaps the old entries for it in one atomic write, and only then are
 // the old files deleted. A crash before the swap leaves the merged file an
 // orphan, after it the old files; Open removes orphans either way.
 
-// compactChunk is how many rows of each file are held at a time.
+// compactChunk is how many rows of each file are handed over at a time.
 const compactChunk = 512
 
-// compactAll merges the partitions that qualify.
+// mergesPerLook is how many merges one look at a partition may do.
+const mergesPerLook = 4
+
+// compactAll merges in the partitions that qualify.
 func (s *Store) compactAll(now time.Time) error {
 	for _, table := range []string{tableLogs, tableEvents} {
 		dirs, err := s.partitionDirs(table)
@@ -45,20 +63,28 @@ func (s *Store) compactAll(now time.Time) error {
 			return err
 		}
 		for _, dir := range dirs {
-			if err := s.maybeCompact(table, dir, now); err != nil {
-				return err
+			for range mergesPerLook {
+				merged, err := s.maybeCompact(table, dir, now)
+				if err != nil {
+					return err
+				}
+				if !merged {
+					break
+				}
 			}
 		}
 	}
 	return nil
 }
 
-func (s *Store) maybeCompact(table, dir string, now time.Time) error {
+// maybeCompact does one merge in the partition, if it qualifies and has a
+// group to merge, and reports whether it did.
+func (s *Store) maybeCompact(table, dir string, now time.Time) (bool, error) {
 	s.mu.Lock()
 	m, err := loadManifest(dir)
 	if err != nil {
 		s.mu.Unlock()
-		return err
+		return false, err
 	}
 	var eligible []manifestFile
 	for _, f := range m.Files {
@@ -74,21 +100,26 @@ func (s *Store) maybeCompact(table, dir string, now time.Time) error {
 	}
 	tooMany := len(eligible) >= s.opts.Compact.MaxFiles
 	finished := hourOver && len(eligible) >= s.opts.Compact.MinFiles
-	if len(eligible) < 2 || (!tooMany && !finished) {
+	if !tooMany && !finished {
 		s.mu.Unlock()
-		return nil
+		return false, nil
+	}
+	group := s.opts.Compact.group(eligible)
+	if len(group) < 2 {
+		s.mu.Unlock()
+		return false, nil
 	}
 	// The merged file is written before the old ones go: without room for
 	// both, compaction would only fail half way.
-	if ok, err := s.roomFor(eligible); err != nil || !ok {
+	if ok, err := s.roomFor(group); err != nil || !ok {
 		s.mu.Unlock()
 		if err == nil {
 			s.m.compactSkipped.Inc()
 		}
-		return err
+		return false, err
 	}
-	keys := make([]string, 0, len(eligible))
-	for _, f := range eligible {
+	keys := make([]string, 0, len(group))
+	for _, f := range group {
 		k := fileKey(table, m.Partition, f.Name)
 		s.claim(k, "compaction")
 		keys = append(keys, k)
@@ -97,14 +128,44 @@ func (s *Store) maybeCompact(table, dir string, now time.Time) error {
 	defer s.release(keys...)
 
 	if table == tableLogs {
-		return compactFiles(s, dir, m.Partition, eligible, func(a, b *LogRow) int {
+		err = compactFiles(s, dir, m.Partition, group, func(a, b *LogRow) int {
 			if c := cmp.Compare(a.ContainerID, b.ContainerID); c != 0 {
 				return c
 			}
 			return a.TS.Compare(b.TS)
 		})
+	} else {
+		err = compactFiles(s, dir, m.Partition, group, func(a, b *EventRow) int { return a.TS.Compare(b.TS) })
 	}
-	return compactFiles(s, dir, m.Partition, eligible, func(a, b *EventRow) int { return a.TS.Compare(b.TS) })
+	return err == nil, err
+}
+
+// group picks the files of the next merge: the oldest run of small files next
+// to each other that stays within GroupFiles and GroupBytes. Small is up to a
+// quarter of GroupBytes, so two small files always fit and any run of two or
+// more gives a group; nil is no group.
+func (o CompactOptions) group(files []manifestFile) []manifestFile {
+	slices.SortFunc(files, func(a, b manifestFile) int { return cmp.Compare(a.Segments[0], b.Segments[0]) })
+	var run []manifestFile
+	var raw int64
+	for _, f := range files {
+		small := f.BytesRaw <= o.GroupBytes/4
+		if small && len(run) < o.GroupFiles && raw+f.BytesRaw <= o.GroupBytes {
+			run, raw = append(run, f), raw+f.BytesRaw
+			continue
+		}
+		if len(run) >= 2 {
+			return run
+		}
+		run, raw = run[:0], 0
+		if small {
+			run, raw = append(run, f), f.BytesRaw
+		}
+	}
+	if len(run) >= 2 {
+		return run
+	}
+	return nil
 }
 
 func compactFiles[T row](s *Store, dir, part string, files []manifestFile, cmpRows func(a, b *T) int) error {

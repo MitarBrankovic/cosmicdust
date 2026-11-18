@@ -162,7 +162,7 @@ underscores: `-data-dir` is `COSMICDUST_DATA_DIR`. A flag on the command line wi
 | `-max-line`, `-max-message` | `1MiB`, `256KiB` | longer physical lines are skipped, longer messages cut |
 | `-skip-exited` | `false` | leave what containers not running when first seen left unread |
 | `-wal-segment-bytes`, `-wal-segment-age` | `8MiB`, `5s` | seal a WAL segment at this size or age |
-| `-convert-every`, `-compact-every` | `10s`, `30s` | turn sealed segments into Parquet; merge finished hours |
+| `-convert-every`, `-compact-every` | `10s`, `30s` | turn sealed segments into Parquet; merge the small files that pile up unsynced, a few at a time |
 | `-convert-bytes` | `32MiB` | log text one conversion takes; a backlog goes in pieces this size |
 | `-sort-bytes` | `4MiB` | log text sorted at a time while converting |
 | `-parquet-page-bytes` | `1MiB` | Parquet page size; a file being written keeps a buffer this size per column |

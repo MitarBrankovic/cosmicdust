@@ -83,9 +83,16 @@ type Options struct {
 // CompactOptions configure compaction.
 type CompactOptions struct {
 	Every    time.Duration // how often partitions are looked at; default 30 s
-	MinFiles int           // merge a finished hour with at least this many files; default 2
-	MaxFiles int           // merge at once past this many; default 200
+	MinFiles int           // merge in a finished hour with at least this many unsynced files; default 2
+	MaxFiles int           // merge without waiting for the hour to end past this many; default 200
 	Grace    time.Duration // how long after its end an hour may still get rows; default 2 min
+
+	// One merge reads at most GroupFiles files (default 8) whose rows add up
+	// to at most GroupBytes of raw size, the manifest's bytes_raw (default
+	// 8 MiB): that bounds the memory of a merge, whatever the hour holds.
+	// Only files of up to a quarter of GroupBytes are merged.
+	GroupFiles int
+	GroupBytes int64
 }
 
 // Store keeps the node's Parquet files. It is a cosmicdust.Component (Run) and a
@@ -198,6 +205,12 @@ func Open(opts Options) (*Store, error) {
 	}
 	if opts.Compact.Grace <= 0 {
 		opts.Compact.Grace = 2 * time.Minute
+	}
+	if opts.Compact.GroupFiles < 2 {
+		opts.Compact.GroupFiles = 8
+	}
+	if opts.Compact.GroupBytes <= 0 {
+		opts.Compact.GroupBytes = 8 << 20
 	}
 	switch opts.WhenFull {
 	case "":
