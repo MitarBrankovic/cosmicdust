@@ -195,7 +195,7 @@ collector_run() { # <experiment> <x> <collector> <case> <round>
 			-v /var/lib/docker/containers:/var/lib/docker/containers:ro \
 			-v /var/run/docker.sock:/var/run/docker.sock:ro \
 			-v /run/docker/containerd/containerd.sock:/run/containerd/containerd.sock:ro \
-			-e COSMICDUST_NODE=node-1 -e COSMICDUST_SYNC_URL="grpc://$GATEWAY:$GRPC_PORT" \
+			-e COSMICDUST_NODE=node-1 -e COSMICDUST_SYNC_URL="$(sync_url)" \
 			-e COSMICDUST_APP_LABELS=app "$AGENT_IMAGE") || die "cannot start the agent"
 		;;
 	fluent-bit)
